@@ -258,6 +258,19 @@ export type AIAgentExtra = {
   temperature?: number;
   max_tokens?: number;
   thinking?: "minimal" | "low" | "medium" | "high";
+  /**
+   * Whether one turn may produce several messages. Default true: the agent is
+   * given a `respond` tool and `tool_choice: "required"`, so it answers by
+   * calling it with an array — which is how a bot sends three bubbles instead
+   * of one wall of text.
+   *
+   * Set false for models a provider will not let you force a tool on —
+   * reasoning-mode models reject `tool_choice: "required"` outright. The agent
+   * then answers in plain text and each turn is a single message. Either mode
+   * leaves the same rows behind (the `respond` call is not a tool trace), so
+   * this is safe to flip on a conversation already underway.
+   */
+  multi_message_response?: boolean;
   instructions?: string;
   send_inline_files_up_to_size_mb?: number;
   tools?: ToolConfig[];

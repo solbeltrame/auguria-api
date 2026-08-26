@@ -19,6 +19,7 @@ import type {
 import { isToolTrace } from "../../_shared/supabase.ts";
 import {
   type AgentProtocolHandler,
+  type AgentRowWithExtra,
   contextHeaders,
   type RequestContext,
   type ResponseContext,
@@ -33,7 +34,11 @@ import utc from "dayjs/plugin/utc";
 import { inspect } from "node:util";
 dayjs.extend(utc);
 
-const MULTI_MESSAGE_RESPONSE = true;
+// Whether this agent answers by calling `respond` (several messages per
+// turn) or in plain text (one). Opt out per agent — see AIAgentExtra.
+const multiMessageResponse = (agent: AgentRowWithExtra): boolean =>
+  agent.extra.multi_message_response ?? true;
+
 const RESPOND_FUNCTION_NAME = "respond";
 
 const RESPOND_TOOL: ChatCompletionTool = {
@@ -427,7 +432,7 @@ export class ChatCompletionsHandler
       },
     }));
 
-    if (MULTI_MESSAGE_RESPONSE) {
+    if (multiMessageResponse(agent)) {
       chatCompletionTools.push(RESPOND_TOOL);
     }
 
@@ -556,7 +561,7 @@ export class ChatCompletionsHandler
           messages: request.messages,
           // TOOLS
           tools: request.tools.length ? request.tools : undefined,
-          tool_choice: MULTI_MESSAGE_RESPONSE ? "required" : undefined,
+          tool_choice: multiMessageResponse(agent) ? "required" : undefined,
           parallel_tool_calls: request.tools.length ? true : undefined,
           // THINKING
           // ts-expect-error
@@ -792,7 +797,7 @@ export class ChatCompletionsHandler
     // TODO: finish reasons: length, content filter
 
     if (finish_reason === "stop" && message.content) {
-      if (MULTI_MESSAGE_RESPONSE) {
+      if (multiMessageResponse(agent)) {
         log.warn(
           "Unexpected stop finish_reason with tool_choice: required. Falling back to text response.",
         );

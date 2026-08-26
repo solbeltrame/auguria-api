@@ -10,6 +10,7 @@ import type {
 import { isToolTrace } from "../../_shared/supabase.ts";
 import {
   type AgentProtocolHandler,
+  type AgentRowWithExtra,
   contextHeaders,
   type RequestContext,
   type ResponseContext,
@@ -43,7 +44,11 @@ type ResponsesTool = OpenAI.Responses.Tool;
 type FunctionCallItem = OpenAI.Responses.ResponseFunctionToolCall;
 type ResponsesResponse = OpenAI.Responses.Response;
 
-const MULTI_MESSAGE_RESPONSE = true;
+// Whether this agent answers by calling `respond` (several messages per
+// turn) or in plain text (one). Opt out per agent — see AIAgentExtra.
+const multiMessageResponse = (agent: AgentRowWithExtra): boolean =>
+  agent.extra.multi_message_response ?? true;
+
 const RESPOND_FUNCTION_NAME = "respond";
 
 const RESPOND_TOOL: ResponsesTool = {
@@ -348,7 +353,7 @@ export class ResponsesHandler
       parameters: tool.inputSchema as Record<string, unknown>,
     }));
 
-    if (MULTI_MESSAGE_RESPONSE) {
+    if (multiMessageResponse(agent)) {
       tools.push(RESPOND_TOOL);
     }
 
@@ -459,7 +464,7 @@ export class ResponsesHandler
           temperature: agent.extra.temperature ?? undefined,
           max_output_tokens: agent.extra.max_tokens ?? undefined,
           tools: request.tools.length ? request.tools : undefined,
-          tool_choice: MULTI_MESSAGE_RESPONSE ? "required" : undefined,
+          tool_choice: multiMessageResponse(agent) ? "required" : undefined,
           parallel_tool_calls: request.tools.length ? true : undefined,
           store: false,
         });
@@ -681,7 +686,7 @@ export class ResponsesHandler
       .trim();
 
     if (text) {
-      if (MULTI_MESSAGE_RESPONSE) {
+      if (multiMessageResponse(agent)) {
         log.warn(
           "Unexpected text output with tool_choice: required. Falling back to text response.",
         );
