@@ -287,7 +287,14 @@ begin
       and address = new.conversation_address;
   end if;
 
-  -- Create conversation if it doesn't exist.
+  -- Create conversation if it doesn't exist. Two messages for a peer nobody
+  -- has spoken to yet can arrive at once — a webhook batch, or two batches in
+  -- flight — and both find nothing above, so the insert has to survive losing
+  -- that race rather than raise on conversations_identity_idx. `do nothing`
+  -- returns no row when the other writer won; read its id back instead.
+  --
+  -- A peerless (local) conversation_address is null, which is distinct from
+  -- itself in a unique index, so that path never conflicts and always mints.
   if new.conversation_id is null then
     insert into public.conversations (
       organization_id,
@@ -300,7 +307,18 @@ begin
       new.conversation_address,
       new.service
     )
+    on conflict (organization_id, organization_address, service, address)
+    do nothing
     returning id into new.conversation_id;
+
+    if new.conversation_id is null then
+      select id into new.conversation_id
+      from public.conversations
+      where organization_id = new.organization_id
+        and service = new.service
+        and organization_address = new.organization_address
+        and address = new.conversation_address;
+    end if;
   end if;
 
   return new;
