@@ -540,6 +540,9 @@ Deno.serve(async (req) => {
         .from("messages")
         .update({
           status: {
+            // Terminal, so the arm bit goes with it — same reason
+            // commitDispatchedMessage retracts on success.
+            pending: null,
             failed: new Date().toISOString(),
             errors: [errorDetail],
           },

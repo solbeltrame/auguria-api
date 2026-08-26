@@ -5,7 +5,18 @@ import * as log from "./logger.ts";
 
 /**
  * Persists the result of dispatching an outgoing message: stamps the
- * service-assigned `external_id` and merges in the given status.
+ * service-assigned `external_id`, merges in the given status, and retracts the
+ * arm bit — the service has the message now, so the row is no longer something
+ * to send. `pending` is a merge-patch null (RFC 7396), which REMOVES the key.
+ *
+ * Retracting is the writer's job, not a trigger's: only the caller knows the
+ * send actually happened. The retry sweep already skips rows carrying
+ * `accepted`, so this changes no dispatch behaviour — it stops outgoing rows
+ * from reading as simultaneously queued and sent to everyone downstream (the
+ * UI, `notify_webhook`, anything asking whether a message is still in flight).
+ *
+ * Only the success path. A transient failure keeps the arm bit deliberately —
+ * that is what the sweep re-fires on.
  *
  * Handles the race where a webhook for the same `external_id` lands before this
  * update and inserts its own row — e.g. a `sent`/`read` status (or an echo)
@@ -31,9 +42,16 @@ export async function commitDispatchedMessage({
   externalId?: string;
   status: Record<string, Json>;
 }): Promise<void> {
+  // Caller-stated keys win, so a dispatcher that has a reason to keep the row
+  // armed can say so.
+  const patch: Record<string, Json> = { pending: null, ...status };
+
   const { error } = await client
     .from("messages")
-    .update({ ...(externalId && { external_id: externalId }), status })
+    .update({
+      ...(externalId && { external_id: externalId }),
+      status: patch,
+    })
     .eq("id", messageId);
 
   if (!error) return;
@@ -78,7 +96,7 @@ export async function commitDispatchedMessage({
     .from("messages")
     .update({
       external_id: externalId,
-      status: { ...duplicateStatus, ...status },
+      status: { ...duplicateStatus, ...patch },
     })
     .eq("id", messageId)
     .throwOnError();
