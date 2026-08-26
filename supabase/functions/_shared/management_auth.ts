@@ -34,12 +34,15 @@ type Middleware = (
 
 /**
  * The organization the request is about: the query string when present
- * (GET/DELETE), the JSON body otherwise. The body is cloned because
- * middleware must not consume the stream.
+ * (GET/DELETE), the JSON body otherwise. Read through `c.req.json()`, which
+ * memoizes the parse, because these gates run on both sides of the handler —
+ * `requireScope` re-enters the admin gate after the handler has already read
+ * the body, and the underlying stream is only readable once.
  */
 async function getOrganizationId(c: Context<ManagementEnv>): Promise<string> {
   const organization_id = c.req.query("organization_id") ??
-    (await c.req.raw.clone().json().catch(() => ({}))).organization_id;
+    (await c.req.json<{ organization_id?: string }>()
+      .catch(() => ({} as { organization_id?: string }))).organization_id;
 
   if (!organization_id) {
     throw new HTTPException(400, { message: "organization_id is required" });
