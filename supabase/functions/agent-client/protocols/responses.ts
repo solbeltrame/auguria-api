@@ -12,6 +12,7 @@ import {
   type AgentProtocolHandler,
   type AgentRowWithExtra,
   contextHeaders,
+  normalizeToolName,
   type RequestContext,
   type ResponseContext,
 } from "./base.ts";
@@ -605,7 +606,7 @@ export class ResponsesHandler
     if (functionCalls.length) {
       // The virtual respond tool call, if present.
       const respondCall = functionCalls.find(
-        (fc) => fc.name === RESPOND_FUNCTION_NAME,
+        (fc) => normalizeToolName(fc.name) === RESPOND_FUNCTION_NAME,
       );
 
       if (respondCall) {
@@ -619,7 +620,7 @@ export class ResponsesHandler
 
       const messages = functionCalls.map((toolCall): MessageInsert => {
         let tool: ToolEventInfo & LocalToolInfo;
-        const name = toolCall.name;
+        const name = normalizeToolName(toolCall.name);
         const text = toolCall.arguments;
 
         if (name.includes(this.FUNCTION_NAME_SEPARATOR)) {

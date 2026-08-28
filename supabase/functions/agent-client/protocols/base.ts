@@ -33,6 +33,20 @@ export interface ResponseContext {
   agent?: AgentRowWithExtra;
 }
 
+/**
+ * The tool name as the model meant it, not as the provider spelled it.
+ * gpt-oss (harmony) leaks its own framing into the name it emits — a
+ * `functions.` namespace prefix, or a trailing `<|channel|>commentary`
+ * marker — and matching those literally drops the call on the floor: the
+ * answer the model wrote is recorded as a call to a tool nobody has, and the
+ * user gets silence.
+ *
+ * A no-op on a well-behaved name, so it costs nothing to run on every call.
+ */
+export function normalizeToolName(name: string): string {
+  return name.split("<|")[0].trim().replace(/^functions\./, "");
+}
+
 export function contextHeaders(
   context: RequestContext,
 ): Record<string, string> {

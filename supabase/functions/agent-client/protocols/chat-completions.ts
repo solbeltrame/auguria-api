@@ -21,6 +21,7 @@ import {
   type AgentProtocolHandler,
   type AgentRowWithExtra,
   contextHeaders,
+  normalizeToolName,
   type RequestContext,
   type ResponseContext,
 } from "./base.ts";
@@ -267,33 +268,29 @@ export class ChatCompletionsHandler
           .filter(Boolean)
           .join(this.FUNCTION_NAME_SEPARATOR);
 
-        if (part.type === "data") {
-          const toolCall: ChatCompletionMessageToolCall = {
-            id: part.tool.use_id,
-            function: {
-              name,
-              arguments: JSON.stringify(part.data),
-            },
-            type: "function",
-          };
+        // Which KIND of call this was is `tool.type`, not how the row stores
+        // the payload: processResponse records every trace as a text part, so
+        // reading the part would replay an ordinary function call as a
+        // `custom` one. OpenAI tolerates that; a strict provider rejects the
+        // whole request, and since the row replays on every later turn the
+        // conversation stays broken until it falls out of the window.
+        if (part.type === "data" || part.type === "text") {
+          const input = part.type === "data"
+            ? JSON.stringify(part.data)
+            : part.text;
 
-          const message: ChatCompletionAssistantMessageParam = {
-            role: "assistant",
-            tool_calls: [toolCall],
-          };
-
-          return message;
-        }
-
-        if (part.type === "text") {
-          const toolCall: ChatCompletionMessageToolCall = {
-            id: part.tool.use_id,
-            custom: {
-              name,
-              input: part.text,
-            },
-            type: "custom",
-          };
+          const toolCall: ChatCompletionMessageToolCall =
+            part.tool.type === "custom"
+              ? {
+                id: part.tool.use_id,
+                custom: { name, input },
+                type: "custom",
+              }
+              : {
+                id: part.tool.use_id,
+                function: { name, arguments: input },
+                type: "function",
+              };
 
           const message: ChatCompletionAssistantMessageParam = {
             role: "assistant",
@@ -713,7 +710,8 @@ export class ChatCompletionsHandler
       // Check for the virtual respond tool call
       const respondCall = message.tool_calls.find(
         (tc) =>
-          tc.type === "function" && tc.function.name === RESPOND_FUNCTION_NAME,
+          tc.type === "function" &&
+          normalizeToolName(tc.function.name) === RESPOND_FUNCTION_NAME,
       );
 
       if (respondCall) {
@@ -730,10 +728,10 @@ export class ChatCompletionsHandler
         let text: string;
 
         if (toolCall.type === "custom") {
-          name = toolCall.custom.name;
+          name = normalizeToolName(toolCall.custom.name);
           text = toolCall.custom.input;
         } else {
-          name = toolCall.function.name;
+          name = normalizeToolName(toolCall.function.name);
           text = toolCall.function.arguments;
         }
 
