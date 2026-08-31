@@ -1,5 +1,6 @@
 # Env
 .env*
+!.env.example
 
 # Editors
 .vscode
