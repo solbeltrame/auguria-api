@@ -414,20 +414,23 @@ export class ResponsesHandler
 
     const billable = !agent.extra.api_key;
 
-    // Fetch cost pricing before the LLM call.
-    const { data: costs } = await this.client
-      .schema("billing")
-      .from("costs")
-      .select("pricing, quantity")
-      .eq("provider", provider)
-      .eq("product", model)
-      .lte("effective_at", new Date().toISOString())
-      .order("effective_at", { ascending: false })
-      .limit(1)
-      .maybeSingle()
-      .throwOnError();
+    let costs: { pricing: unknown; quantity: number } | null = null;
 
     if (billable) {
+      const { data } = await this.client
+        .schema("billing")
+        .from("costs")
+        .select("pricing, quantity")
+        .eq("provider", provider)
+        .eq("product", model)
+        .lte("effective_at", new Date().toISOString())
+        .order("effective_at", { ascending: false })
+        .limit(1)
+        .maybeSingle()
+        .throwOnError();
+
+      costs = data;
+
       if (!costs) {
         throw new Error(`No pricing found for ${provider}/${model}`);
       }
@@ -497,7 +500,7 @@ export class ResponsesHandler
     }
 
     // Record AI usage in the ledger.
-    if (response.usage) {
+    if (billable && response.usage) {
       const cost = costs
         ? this.calculateCost(
           response.usage,
