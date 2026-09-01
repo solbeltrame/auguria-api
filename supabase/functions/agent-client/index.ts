@@ -10,6 +10,7 @@ import {
   isInternal,
   isToolTrace,
   type LocalMCPToolConfig,
+  type Memory,
   type MessageInsert,
   type MessageRow,
   type OutgoingMessage,
@@ -74,6 +75,57 @@ const MESSAGES_QUANTITY_LIMIT = 50;
 const RESPONSE_DELAY_SECS = 3; // 3 seconds
 const MEDIA_PREPROCESSING_TIMEOUT = 30 * 1000; // 30 seconds
 const MEDIA_PREPROCESSING_POLLING_INTERVAL = 5 * 1000; // 5 seconds
+const MEMORY_KEY_MAX_LENGTH = 80;
+const MEMORY_VALUE_MAX_LENGTH = 500;
+const MEMORY_KEY_SENSITIVE_PATTERN =
+  /(?:password|senha|secret|token|api[_ -]?key|chave[_ -]?api|cvv|credit[_ -]?card|cart[aã]o)/i;
+
+function memoryObject(
+  memory: Memory | undefined | null,
+): Record<string, unknown> {
+  if (!memory || typeof memory !== "object" || Array.isArray(memory)) return {};
+  return memory as Record<string, unknown>;
+}
+
+function memoryContext(memory: Memory | undefined | null): string {
+  const entries = Object.entries(memoryObject(memory)).filter(
+    ([, value]) => typeof value === "string" && value.trim(),
+  );
+  if (!entries.length) return "Nenhuma informação persistente salva ainda.";
+
+  return entries
+    .map(([key, value]) => `${key}: ${String(value).trim()}`)
+    .join("\n");
+}
+
+function normalizeMemoryKey(value: unknown): string {
+  if (typeof value !== "string") {
+    throw new Error("A chave da memória deve ser texto");
+  }
+  const key = value.trim().toLowerCase();
+  if (!key || key.length > MEMORY_KEY_MAX_LENGTH) {
+    throw new Error(
+      "A chave da memória é obrigatória e deve ter até 80 caracteres",
+    );
+  }
+  if (MEMORY_KEY_SENSITIVE_PATTERN.test(key)) {
+    throw new Error(
+      "Não posso guardar senhas, tokens ou outros segredos na memória",
+    );
+  }
+  return key;
+}
+
+function normalizeMemoryValue(value: unknown): string {
+  if (typeof value !== "string") {
+    throw new Error("O valor da memória deve ser texto");
+  }
+  const normalized = value.trim().replace(/\s+/g, " ");
+  if (!normalized || normalized.length > MEMORY_VALUE_MAX_LENGTH) {
+    throw new Error("O valor da memória deve ter entre 1 e 500 caracteres");
+  }
+  return normalized;
+}
 
 function collectKnowledgeText(part: unknown, output: string[]): void {
   if (!part || typeof part !== "object") return;
@@ -571,6 +623,7 @@ Deno.serve(async (req) => {
     messages,
     contact,
     agent: agent as AgentRowWithExtra,
+    memoryContext: memoryContext(conv.extra.memory),
   };
 
   if (agent.extra.tools) {
@@ -599,6 +652,90 @@ Deno.serve(async (req) => {
   let iteration = 0;
   const max_iterations = 10;
   let shouldContinue = true;
+
+  const persistMemory = async (nextMemory: Memory): Promise<Memory> => {
+    const { data: latest } = await client
+      .from("conversations")
+      .select("extra")
+      .eq("id", conversation.id)
+      .single()
+      .throwOnError();
+    const nextExtra = { ...(latest.extra ?? {}), memory: nextMemory };
+
+    const { data: updated } = await client
+      .from("conversations")
+      .update({ extra: nextExtra })
+      .eq("id", conversation.id)
+      .select("extra")
+      .single()
+      .throwOnError();
+
+    const savedExtra = updated.extra ?? nextExtra;
+    conv.extra = savedExtra;
+    conversation.extra = savedExtra;
+    context.memoryContext = memoryContext(savedExtra.memory);
+    return savedExtra.memory ?? {};
+  };
+
+  const memoryTools: AgentTool[] = [
+    {
+      provider: "local",
+      type: "function",
+      label: "memory",
+      name: "remember",
+      description:
+        "Save one stable, useful fact or preference about the contact for future conversations. Never save passwords, tokens, secrets, or payment data.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          key: { type: "string", description: "Short fact name" },
+          value: { type: "string", description: "Fact value" },
+        },
+        required: ["key", "value"],
+        additionalProperties: false,
+      },
+      implementation: async (args: { key?: unknown; value?: unknown }) => {
+        const key = normalizeMemoryKey(args.key);
+        const value = normalizeMemoryValue(args.value);
+        const nextMemory = {
+          ...memoryObject(conversation.extra?.memory),
+          [key]: value,
+        } as Memory;
+        await persistMemory(nextMemory);
+        return { saved: true, key };
+      },
+    },
+    {
+      provider: "local",
+      type: "function",
+      label: "memory",
+      name: "forget",
+      description:
+        "Remove a previously saved memory by key. Use key '*' only when the contact explicitly asks to erase all remembered information.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          key: { type: "string", description: "Fact name or '*'" },
+        },
+        required: ["key"],
+        additionalProperties: false,
+      },
+      implementation: async (args: { key?: unknown }) => {
+        const rawKey = typeof args.key === "string" ? args.key.trim() : "";
+        if (rawKey === "*") {
+          await persistMemory({});
+          return { deleted: true, all: true };
+        }
+
+        const key = normalizeMemoryKey(args.key);
+        const nextMemory = { ...memoryObject(conversation.extra?.memory) };
+        const existed = Object.prototype.hasOwnProperty.call(nextMemory, key);
+        delete nextMemory[key];
+        await persistMemory(nextMemory as Memory);
+        return { deleted: existed, key };
+      },
+    },
+  ];
 
   // Basic ReAct algorithm: stop if no tool uses are found.
   while (shouldContinue) {
@@ -740,7 +877,7 @@ Deno.serve(async (req) => {
        * - `ToolDefinition`, which as its name suggests, defines the tool (`label` is unknown at definition, only `name`).
        * - `AgentTool`, the combination of config and definition, to be passed to the agent.
        */
-      const tools: AgentTool[] = [];
+      const tools: AgentTool[] = [...memoryTools];
 
       for (const toolConfig of agent.extra.tools || []) {
         if (toolConfig.provider !== "local") {

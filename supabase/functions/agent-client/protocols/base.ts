@@ -25,6 +25,7 @@ export interface RequestContext {
   contact?: ContactInfo;
   agent: AgentRowWithExtra;
   knowledgeContext?: string;
+  memoryContext?: string;
 }
 
 export interface ResponseContext {
