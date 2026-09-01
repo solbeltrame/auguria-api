@@ -37,6 +37,7 @@ const KNOWLEDGE_GROQ_MODEL = "qwen/qwen3.6-27b";
 const KNOWLEDGE_GROQ_TRANSCRIPTION_MODEL = "whisper-large-v3-turbo";
 const MAX_GROQ_PDF_PAGES = 6;
 const MAX_GROQ_PDF_RENDER_DIMENSION = 1_200;
+const STALE_PROCESSING_MS = 5 * 60 * 1_000;
 const MAX_PDF_TEXT_STREAM_BYTES = 512_000;
 const MAX_PDF_DECOMPRESSED_STREAM_BYTES = 4_000_000;
 const MAX_PDF_OPERATOR_SOURCE_BYTES = 1_000_000;
@@ -1092,6 +1093,33 @@ async function processDocumentAndRefreshContext(
   return processed;
 }
 
+async function recoverStaleProcessingDocuments(
+  organizationId: string,
+  baseId?: string,
+): Promise<void> {
+  const cutoff = new Date(Date.now() - STALE_PROCESSING_MS).toISOString();
+  const client = createUnsecureClient();
+  let query = client
+    .from("knowledge_documents")
+    .update({
+      status: "error",
+      error_message:
+        "O processamento foi interrompido antes de concluir. Tente processar novamente.",
+    })
+    .eq("organization_id", organizationId)
+    .eq("status", "processing")
+    .lt("updated_at", cutoff);
+  if (baseId) query = query.eq("knowledge_base_id", baseId);
+  const { error } = await query;
+  if (error) {
+    log.warn("Could not recover stale knowledge documents", {
+      organization_id: organizationId,
+      knowledge_base_id: baseId,
+      error,
+    });
+  }
+}
+
 app.get(
   "/knowledge-management/bases",
   requireRoles(["member", "admin", "owner"]),
@@ -1425,8 +1453,13 @@ app.get(
   "/knowledge-management/documents",
   requireRoles(["member", "admin", "owner"]),
   async (c) => {
-    const organizationId = c.req.query("organization_id");
+    const organizationId = requireText(
+      c.req.query("organization_id"),
+      "organization_id",
+      80,
+    );
     const baseId = c.req.query("knowledge_base_id");
+    await recoverStaleProcessingDocuments(organizationId, baseId);
     const client = c.get("supabase");
     let query = client
       .from("knowledge_documents")
