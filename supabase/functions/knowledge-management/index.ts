@@ -7,6 +7,14 @@ import { GoogleGenAI } from "@google/genai";
 import { encodeBase64 } from "jsr:@std/encoding/base64";
 import * as log from "../_shared/logger.ts";
 import {
+  groqChat,
+  groqTranscribe,
+  groqVision,
+  groqVisionBatch,
+  groqVisionUrl,
+} from "../_shared/groq.ts";
+import { renderPdfPages } from "../_shared/pdf-renderer.ts";
+import {
   createApiClient,
   createClient,
   createUnsecureClient,
@@ -25,6 +33,9 @@ const MAX_SYNTHESIS_SOURCE = 140_000;
 const CHUNK_SIZE = 1_200;
 const CHUNK_OVERLAP = 160;
 const KNOWLEDGE_GEMINI_MODEL = "gemini-2.5-flash";
+const KNOWLEDGE_GROQ_MODEL = "qwen/qwen3.6-27b";
+const KNOWLEDGE_GROQ_TRANSCRIPTION_MODEL = "whisper-large-v3-turbo";
+const MAX_GROQ_PDF_PAGES = 6;
 const MAX_PDF_TEXT_STREAM_BYTES = 512_000;
 const MAX_PDF_DECOMPRESSED_STREAM_BYTES = 4_000_000;
 const MAX_PDF_OPERATOR_SOURCE_BYTES = 1_000_000;
@@ -44,8 +55,17 @@ type KnowledgeDocumentInput = {
 
 type ExtractionResult = {
   text: string;
-  method: "text" | "office-xml" | "pdf-text" | "gemini";
+  method: "text" | "office-xml" | "pdf-text" | "gemini" | "groq";
   description?: string;
+};
+
+type MediaConfig = {
+  provider: "google" | "groq";
+  apiKey?: string;
+  model: string;
+  transcriptionModel: string;
+  language?: string;
+  imageUrl?: string;
 };
 
 const app = new Hono<AppEnv>();
@@ -422,7 +442,9 @@ async function inflatePdfStream(bytes: Uint8Array): Promise<Uint8Array> {
     total += part.byteLength;
     if (total > MAX_PDF_DECOMPRESSED_STREAM_BYTES) {
       await reader.cancel();
-      throw new Error("O conteúdo comprimido do PDF excede o limite de leitura");
+      throw new Error(
+        "O conteúdo comprimido do PDF excede o limite de leitura",
+      );
     }
     parts.push(part);
   }
@@ -502,7 +524,7 @@ async function extractPdfText(bytes: Uint8Array): Promise<string> {
   );
 }
 
-function isGeminiMedia(mimeType: string): boolean {
+function isAiMedia(mimeType: string): boolean {
   return mimeType.startsWith("image/") || mimeType.startsWith("audio/") ||
     mimeType.startsWith("video/");
 }
@@ -536,34 +558,152 @@ async function extractWithGemini(
   return { text, method: "gemini" };
 }
 
+function speechLanguage(value?: string): string | undefined {
+  if (!value) return undefined;
+  const normalized = value.trim().toLowerCase();
+  if (/^[a-z]{2}(?:-[a-z]{2})?$/.test(normalized)) {
+    return normalized.slice(0, 2);
+  }
+  if (normalized.includes("portugu")) return "pt";
+  if (normalized.includes("spanish") || normalized.includes("español")) {
+    return "es";
+  }
+  if (normalized.includes("english") || normalized.includes("inglês")) {
+    return "en";
+  }
+  return undefined;
+}
+
+async function extractWithGroq(
+  bytes: Uint8Array,
+  mimeType: string,
+  fileName: string,
+  config: MediaConfig,
+): Promise<ExtractionResult> {
+  if (!config.apiKey) {
+    throw new Error(
+      "Este tipo de arquivo precisa de uma chave Groq em Configurações > Pré-processamento de mídia",
+    );
+  }
+
+  if (mimeType.startsWith("image/")) {
+    if (!["image/png", "image/jpeg", "image/webp"].includes(mimeType)) {
+      throw new Error(
+        `O Groq aceita imagens PNG, JPEG ou WebP; ${mimeType} precisa ser convertido antes do envio`,
+      );
+    }
+    const prompt =
+      `Leia e descreva esta imagem em português do Brasil. Extraia todo texto visível, valores, datas e tabelas de forma organizada. Arquivo: ${fileName}.`;
+    const response = config.imageUrl
+      ? await groqVisionUrl(
+        config.imageUrl,
+        prompt,
+        config.apiKey,
+        config.model,
+      )
+      : await groqVision(
+        bytes,
+        mimeType,
+        prompt,
+        config.apiKey,
+        config.model,
+      );
+    return { text: normalizeText(response.text), method: "groq" };
+  }
+
+  if (mimeType.startsWith("audio/")) {
+    const response = await groqTranscribe(
+      bytes,
+      mimeType,
+      fileName,
+      config.apiKey,
+      config.transcriptionModel,
+      { language: speechLanguage(config.language) },
+    );
+    return { text: normalizeText(response.text), method: "groq" };
+  }
+
+  if (mimeType === "application/pdf") {
+    const rendered = await renderPdfPages(bytes, MAX_GROQ_PDF_PAGES);
+    const sections: string[] = [];
+    for (let index = 0; index < rendered.images.length; index += 3) {
+      const batch = rendered.images.slice(index, index + 3).map((image) => ({
+        bytes: image,
+        mimeType: "image/png",
+      }));
+      const response = await groqVisionBatch(
+        batch,
+        `Leia as páginas deste PDF na ordem apresentada. Extraia todo o texto visível, valores, datas e tabelas em Markdown, preservando a separação por página. Não invente conteúdo. Arquivo: ${fileName}.`,
+        config.apiKey,
+        config.model,
+        { maxCompletionTokens: 10_000 },
+      );
+      sections.push(normalizeText(response.text));
+    }
+    if (rendered.pageCount > rendered.renderedPages) {
+      sections.push(
+        `[As primeiras ${rendered.renderedPages} páginas foram interpretadas pelo Groq; o PDF possui ${rendered.pageCount} páginas.]`,
+      );
+    }
+    const text = normalizeText(sections.join("\n\n"));
+    if (!text) throw new Error("O Groq não conseguiu interpretar o PDF");
+    return { text, method: "groq" };
+  }
+
+  if (mimeType.startsWith("video/")) {
+    throw new Error(
+      "O Groq não interpreta vídeo diretamente. Use Google/Gemini para vídeos ou envie um frame/imagem",
+    );
+  }
+
+  throw new Error(`O Groq não suporta o formato ${mimeType}`);
+}
+
 async function extractFile(
   bytes: Uint8Array,
   fileName: string,
   rawMimeType: string,
-  apiKey?: string,
-  model = KNOWLEDGE_GEMINI_MODEL,
+  config: MediaConfig,
 ): Promise<ExtractionResult> {
   const mimeType = mimeFromName(fileName, rawMimeType);
   const fileExtension = extension(fileName);
 
-  if (isGeminiMedia(mimeType)) {
-    if (!apiKey) {
+  if (isAiMedia(mimeType)) {
+    if (config.provider === "groq") {
+      return await extractWithGroq(bytes, mimeType, fileName, config);
+    }
+    if (!config.apiKey) {
       throw new Error(
         "Este tipo de arquivo precisa de uma chave Google/Gemini para transcrição ou leitura visual",
       );
     }
-    return await extractWithGemini(bytes, mimeType, fileName, apiKey, model);
+    return await extractWithGemini(
+      bytes,
+      mimeType,
+      fileName,
+      config.apiKey,
+      config.model,
+    );
   }
 
   if (mimeType === "application/pdf" || fileExtension === "pdf") {
     const text = await extractPdfText(bytes);
     if (text.length >= 20) return { text, method: "pdf-text" };
-    if (!apiKey) {
+    if (config.provider === "groq") {
+      return await extractWithGroq(bytes, "application/pdf", fileName, config);
+    }
+    if (!config.apiKey) {
       throw new Error(
         "Não encontrei texto selecionável neste PDF. Para ler PDFs escaneados ou diagramados, configure uma chave Google/Gemini em Configurações > Pré-processamento de mídia",
       );
     }
-    return await extractWithGemini(bytes, mimeType, fileName, apiKey, model);
+    return await extractWithGemini(
+      bytes,
+      mimeType,
+      fileName,
+      config.apiKey,
+      config.model,
+    );
   }
 
   if (
@@ -595,16 +735,24 @@ async function extractFile(
     return { text, method: "text" };
   }
 
-  if (apiKey) {
-    return await extractWithGemini(bytes, mimeType, fileName, apiKey, model);
+  if (config.provider === "groq") {
+    return await extractWithGroq(bytes, mimeType, fileName, config);
+  }
+  if (config.apiKey) {
+    return await extractWithGemini(
+      bytes,
+      mimeType,
+      fileName,
+      config.apiKey,
+      config.model,
+    );
   }
   throw new Error(`Formato não suportado sem Google/Gemini: ${mimeType}`);
 }
 
-async function organizationMediaConfig(organizationId: string): Promise<{
-  apiKey?: string;
-  model?: string;
-}> {
+async function organizationMediaConfig(
+  organizationId: string,
+): Promise<MediaConfig> {
   const client = createUnsecureClient();
   const { data } = await client
     .from("organizations")
@@ -614,18 +762,36 @@ async function organizationMediaConfig(organizationId: string): Promise<{
     .throwOnError();
 
   const extra = data.extra as {
-    media_preprocessing?: { api_key?: string; model?: string };
+    media_preprocessing?: {
+      provider?: "google" | "groq";
+      api_key?: string;
+      model?: string;
+      transcription_model?: string;
+      language?: string;
+    };
   } | null;
+  const media = extra?.media_preprocessing;
+  const provider = media?.provider ||
+    (media?.model?.startsWith("qwen/") ? "groq" : "google");
   return {
-    apiKey: extra?.media_preprocessing?.api_key ||
-      Deno.env.get("GOOGLE_API_KEY") || undefined,
-    model: extra?.media_preprocessing?.model || KNOWLEDGE_GEMINI_MODEL,
+    provider,
+    apiKey: media?.api_key ||
+      (provider === "groq"
+        ? Deno.env.get("GROQ_API_KEY")
+        : Deno.env.get("GOOGLE_API_KEY")) ||
+      undefined,
+    model: media?.model ||
+      (provider === "groq" ? KNOWLEDGE_GROQ_MODEL : KNOWLEDGE_GEMINI_MODEL),
+    transcriptionModel: media?.transcription_model ||
+      KNOWLEDGE_GROQ_TRANSCRIPTION_MODEL,
+    language: media?.language,
   };
 }
 
 async function downloadDocumentSource(document: KnowledgeDocumentRow): Promise<{
   bytes: Uint8Array;
   mimeType: string;
+  sourceUrl?: string;
 }> {
   if (document.source_type === "url") {
     if (!document.source_url) throw new Error("A fonte não possui uma URL");
@@ -651,6 +817,7 @@ async function downloadDocumentSource(document: KnowledgeDocumentRow): Promise<{
       bytes,
       mimeType: response.headers.get("content-type")?.split(";", 1)[0] ||
         document.mime_type,
+      sourceUrl: document.source_url,
     };
   }
 
@@ -663,7 +830,10 @@ async function downloadDocumentSource(document: KnowledgeDocumentRow): Promise<{
     throw downloadError || new Error("Arquivo não encontrado");
   }
   const bytes = new Uint8Array(await file.arrayBuffer());
-  return { bytes, mimeType: document.mime_type };
+  const { data: signed } = await client.storage
+    .from("knowledge")
+    .createSignedUrl(document.storage_path, 600);
+  return { bytes, mimeType: document.mime_type, sourceUrl: signed?.signedUrl };
 }
 
 async function processDocument(
@@ -688,8 +858,7 @@ async function processDocument(
       bytes,
       document.file_name,
       source.mimeType,
-      config.apiKey,
-      config.model,
+      { ...config, imageUrl: source.sourceUrl },
     );
     const chunks = splitIntoChunks(extraction.text);
     if (!chunks.length) {
@@ -797,7 +966,7 @@ function compiledInstructions(
 
 async function synthesizeInstructions(
   documents: SynthesisDocument[],
-  config: { apiKey?: string; model?: string },
+  config: MediaConfig,
 ): Promise<string> {
   const fallback = compiledInstructions(documents);
   const source = sourceForSynthesis(documents);
@@ -806,19 +975,34 @@ async function synthesizeInstructions(
   }
 
   try {
+    const prompt = [
+      "Você é o editor da base de conhecimento de uma empresa.",
+      "Consolide as fontes abaixo em um único documento Markdown em português do Brasil para orientar um agente de atendimento.",
+      "Remova duplicações, preserve números, preços, nomes, horários, regras e exceções, e sinalize conflitos sem escolher um lado.",
+      "Não invente informações, não escreva prefácio nem explique o processo.",
+      "Organize o resultado em: identidade e escopo, produtos/serviços, políticas e regras, operação e atendimento, perguntas frequentes e casos de exceção.",
+      "\nFONTES:\n",
+      source,
+    ].join("\n");
+
+    if (config.provider === "groq") {
+      const response = await groqChat(
+        [{ role: "user", content: prompt }],
+        config.apiKey,
+        {
+          model: config.model,
+          temperature: 0.15,
+          maxCompletionTokens: 12_000,
+        },
+      );
+      return normalizeInstructions(response.text) || fallback;
+    }
+
     const genai = new GoogleGenAI({ apiKey: config.apiKey });
     const response = await genai.models.generateContent({
       model: config.model || KNOWLEDGE_GEMINI_MODEL,
       contents: [{
-        text: [
-          "Você é o editor da base de conhecimento de uma empresa.",
-          "Consolide as fontes abaixo em um único documento Markdown em português do Brasil para orientar um agente de atendimento.",
-          "Remova duplicações, preserve números, preços, nomes, horários, regras e exceções, e sinalize conflitos sem escolher um lado.",
-          "Não invente informações, não escreva prefácio nem explique o processo.",
-          "Organize o resultado em: identidade e escopo, produtos/serviços, políticas e regras, operação e atendimento, perguntas frequentes e casos de exceção.",
-          "\nFONTES:\n",
-          source,
-        ].join("\n"),
+        text: prompt,
       }],
       config: {
         temperature: 0.15,

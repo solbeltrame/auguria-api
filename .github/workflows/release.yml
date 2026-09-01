@@ -41,12 +41,14 @@ jobs:
 
       # Deploy Meta/WhatsApp configuration
       - run: |
+          if [ -n "$GROQ_API_KEY" ]; then supabase secrets set GROQ_API_KEY="$GROQ_API_KEY"; fi
           if [ -n "$META_SYSTEM_USER_ID" ]; then supabase secrets set META_SYSTEM_USER_ID="$META_SYSTEM_USER_ID"; fi
           if [ -n "$META_SYSTEM_USER_ACCESS_TOKEN" ]; then supabase secrets set META_SYSTEM_USER_ACCESS_TOKEN="$META_SYSTEM_USER_ACCESS_TOKEN"; fi
           if [ -n "$META_APP_ID" ]; then supabase secrets set META_APP_ID="$META_APP_ID"; fi
           if [ -n "$META_APP_SECRET" ]; then supabase secrets set META_APP_SECRET="$META_APP_SECRET"; fi
           if [ -n "$WHATSAPP_VERIFY_TOKEN" ]; then supabase secrets set WHATSAPP_VERIFY_TOKEN="$WHATSAPP_VERIFY_TOKEN"; fi
         env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           META_SYSTEM_USER_ID: ${{ secrets.META_SYSTEM_USER_ID }}
           META_SYSTEM_USER_ACCESS_TOKEN: ${{ secrets.META_SYSTEM_USER_ACCESS_TOKEN }}
           META_APP_ID: ${{ secrets.META_APP_ID }}

@@ -10,13 +10,41 @@ import {
   type GenerateContentResponse,
   GoogleGenAI,
 } from "@google/genai";
-import { downloadFromStorage, uploadToStorage } from "../_shared/media.ts";
+import {
+  createSignedUrl,
+  downloadFromStorage,
+  uploadToStorage,
+} from "../_shared/media.ts";
 import { encodeBase64 } from "jsr:@std/encoding/base64";
 import * as log from "../_shared/logger.ts";
 import { stringify } from "jsr:@std/csv/stringify";
 import { Json } from "../_shared/db_types.ts";
+import {
+  groqChat,
+  groqTranscribe,
+  groqVision,
+  groqVisionBatch,
+  groqVisionUrl,
+} from "../_shared/groq.ts";
+import { renderPdfPages } from "../_shared/pdf-renderer.ts";
 
 type ModalityTokenCount = { modality: string; tokenCount: number };
+
+type MediaPreprocessingResult = {
+  transcription?: string;
+  description?: string;
+  table?: Array<Array<string>>;
+};
+
+type MediaPreprocessingConfig = {
+  mode?: "active" | "inactive";
+  provider?: "google" | "groq";
+  model?: string;
+  transcription_model?: string;
+  api_key?: string;
+  language?: string;
+  extra_prompt?: string;
+};
 
 function calculateCost(
   usage: GenerateContentResponse["usageMetadata"],
@@ -68,6 +96,146 @@ function calculateCost(
   }
 
   return (inputCost + completion * (pricing.output ?? 0)) / quantity;
+}
+
+function speechLanguage(value?: string): string | undefined {
+  if (!value) return undefined;
+  const normalized = value.trim().toLowerCase();
+  if (/^[a-z]{2}(?:-[a-z]{2})?$/.test(normalized)) {
+    return normalized.slice(0, 2);
+  }
+  if (normalized.includes("portugu")) return "pt";
+  if (normalized.includes("spanish") || normalized.includes("español")) {
+    return "es";
+  }
+  if (normalized.includes("english") || normalized.includes("inglês")) {
+    return "en";
+  }
+  return undefined;
+}
+
+function parseModelJson(value: string): MediaPreprocessingResult | undefined {
+  const cleaned = value
+    .trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/i, "");
+  try {
+    const parsed = JSON.parse(cleaned) as MediaPreprocessingResult;
+    if (!parsed || typeof parsed !== "object") return undefined;
+    return parsed;
+  } catch {
+    return undefined;
+  }
+}
+
+async function preprocessWithGroq(
+  bytes: Uint8Array,
+  mimeType: string,
+  mediaType: string,
+  fileName: string,
+  prompt: string,
+  config: MediaPreprocessingConfig,
+  apiKey: string,
+  model: string,
+  transcriptionModel: string,
+  imageUrl?: string,
+): Promise<
+  { result: MediaPreprocessingResult; usage?: Record<string, unknown> }
+> {
+  if (mediaType === "audio") {
+    const response = await groqTranscribe(
+      bytes,
+      mimeType,
+      fileName,
+      apiKey,
+      transcriptionModel,
+      { language: speechLanguage(config.language) },
+    );
+    return {
+      result: {
+        transcription: response.text,
+        description: "Áudio transcrito pelo Groq Whisper.",
+      },
+      usage: response.usage,
+    };
+  }
+
+  if (mediaType === "image") {
+    if (!["image/png", "image/jpeg", "image/webp"].includes(mimeType)) {
+      throw new Error(
+        `O Groq aceita imagens PNG, JPEG ou WebP; ${mimeType} precisa ser convertido antes do envio`,
+      );
+    }
+    const imagePrompt =
+      `${prompt}\nResponda exclusivamente em JSON com as chaves transcription, description e table.`;
+    const response = imageUrl
+      ? await groqVisionUrl(imageUrl, imagePrompt, apiKey, model, {
+        json: true,
+      })
+      : await groqVision(
+        bytes,
+        mimeType,
+        imagePrompt,
+        apiKey,
+        model,
+        { json: true },
+      );
+    return {
+      result: parseModelJson(response.text) || { transcription: response.text },
+      usage: response.usage,
+    };
+  }
+
+  if (mimeType === "application/pdf") {
+    const rendered = await renderPdfPages(bytes);
+    const sections: string[] = [];
+    const usages: Record<string, unknown>[] = [];
+    for (let index = 0; index < rendered.images.length; index += 3) {
+      const response = await groqVisionBatch(
+        rendered.images.slice(index, index + 3).map((image) => ({
+          bytes: image,
+          mimeType: "image/png",
+        })),
+        `${prompt}\nLeia as páginas na ordem apresentada e preserve a separação por página. Responda em Markdown, sem inventar conteúdo.`,
+        apiKey,
+        model,
+        { maxCompletionTokens: 10_000 },
+      );
+      sections.push(response.text);
+      if (response.usage) usages.push(response.usage);
+    }
+    const suffix = rendered.pageCount > rendered.renderedPages
+      ? `\n\n[As primeiras ${rendered.renderedPages} páginas foram processadas; o PDF possui ${rendered.pageCount} páginas.]`
+      : "";
+    return {
+      result: {
+        transcription: `${sections.join("\n\n")}${suffix}`,
+        description: "PDF interpretado visualmente pelo Groq.",
+      },
+      usage: usages.length ? { requests: usages.length } : undefined,
+    };
+  }
+
+  if (mediaType === "document" && mimeType.startsWith("text/")) {
+    const text = new TextDecoder().decode(bytes).slice(0, 300_000);
+    const response = await groqChat(
+      [{ role: "user", content: `${prompt}\n\nCONTEÚDO DO ARQUIVO:\n${text}` }],
+      apiKey,
+      { model, temperature: 0.1, maxCompletionTokens: 4_000, json: true },
+    );
+    return {
+      result: parseModelJson(response.text) || { description: response.text },
+      usage: response.usage,
+    };
+  }
+
+  if (mediaType === "video") {
+    throw new Error(
+      "O Groq não interpreta vídeos diretamente. Selecione Google/Gemini para vídeos ou envie uma imagem",
+    );
+  }
+
+  throw new Error(`O Groq não suporta o formato ${mimeType}`);
 }
 
 /**
@@ -158,7 +326,8 @@ Deno.serve(async (req) => {
     org.extra = {};
   }
 
-  const config = org.extra.media_preprocessing || {};
+  const config =
+    (org.extra.media_preprocessing || {}) as MediaPreprocessingConfig;
 
   if (config.mode !== "active") {
     return log_update_and_respond(
@@ -167,22 +336,26 @@ Deno.serve(async (req) => {
     );
   }
 
-  const model = config.model || "gemini-2.5-flash";
+  const provider = config.provider ||
+    (config.model?.startsWith("qwen/") ? "groq" : "google");
+  const model = config.model ||
+    (provider === "groq" ? "qwen/qwen3.6-27b" : "gemini-2.5-flash");
+  const transcriptionModel = config.transcription_model ||
+    "whisper-large-v3-turbo";
 
   const language = config.language || "English";
 
-  const apiKey = config.api_key || Deno.env.get("GOOGLE_API_KEY");
+  const apiKey = config.api_key ||
+    (provider === "groq"
+      ? Deno.env.get("GROQ_API_KEY")
+      : Deno.env.get("GOOGLE_API_KEY"));
 
   if (!apiKey) {
     return log_update_and_respond(
       "warn",
-      "GOOGLE_API_KEY not set. Skipping preprocessing.",
+      `${provider.toUpperCase()} API key not set. Skipping preprocessing.`,
     );
   }
-
-  const genai = new GoogleGenAI({
-    apiKey,
-  });
 
   const { content, status } = incoming;
 
@@ -193,8 +366,16 @@ Deno.serve(async (req) => {
     );
   }
 
-  const mimeType = content.file.mime_type;
+  const mimeType = content.file.mime_type.split(";", 1)[0];
   const mediaType = content.kind === "sticker" ? "image" : content.kind;
+  const processingMediaType = [
+      "story",
+      "ig_story",
+      "story_mention",
+      "story_reply",
+    ].includes(mediaType)
+    ? mimeType.startsWith("image/") ? "image" : "video"
+    : mediaType;
 
   const imageMimeTypes = [
     "image/png",
@@ -263,28 +444,34 @@ Deno.serve(async (req) => {
   const shouldUseFileAPI = (content.file.size ?? 0) * 1.33 >
     INLINE_DATA_SIZE_LIMIT;
 
-  if (shouldUseFileAPI) {
+  if (provider === "google" && shouldUseFileAPI) {
     return log_update_and_respond(
       "warn",
       "Base64 encoded data size exceeds 19MB limit. File should be uploaded using the Gemini File API but it is not implemented yet.",
     );
   }
 
-  // Check AI credits balance before touching storage (only when using our API key)
-  const billable = !config.api_key;
+  const billable = provider === "google" && !config.api_key;
+  let costs: { pricing: Record<string, number>; quantity: number } | null =
+    null;
 
-  // Fetch cost pricing before the LLM call
-  const { data: costs } = await client
-    .schema("billing")
-    .from("costs")
-    .select("pricing, quantity")
-    .eq("provider", "google")
-    .eq("product", model)
-    .lte("effective_at", new Date().toISOString())
-    .order("effective_at", { ascending: false })
-    .limit(1)
-    .maybeSingle()
-    .throwOnError();
+  if (provider === "google") {
+    const { data } = await client
+      .schema("billing")
+      .from("costs")
+      .select("pricing, quantity")
+      .eq("provider", "google")
+      .eq("product", model)
+      .lte("effective_at", new Date().toISOString())
+      .order("effective_at", { ascending: false })
+      .limit(1)
+      .maybeSingle()
+      .throwOnError();
+    costs = data as {
+      pricing: Record<string, number>;
+      quantity: number;
+    } | null;
+  }
 
   if (billable) {
     if (!costs) {
@@ -317,7 +504,16 @@ Deno.serve(async (req) => {
     .throwOnError();
 
   const file = await downloadFromStorage(client, content.file.uri);
-  const base64File = encodeBase64(await file.arrayBuffer());
+  const bytes = new Uint8Array(await file.arrayBuffer());
+
+  let imageUrl: string | undefined;
+  if (provider === "groq" && processingMediaType === "image") {
+    try {
+      imageUrl = await createSignedUrl(client, content.file.uri);
+    } catch (error) {
+      log.warn("Could not create a signed media URL for Groq", error);
+    }
+  }
 
   let prompt = "";
 
@@ -355,98 +551,115 @@ Deno.serve(async (req) => {
     prompt += `\n\n${config.extra_prompt}`;
   }
 
-  const responseSchema = {
-    type: "object",
-    properties: {
-      transcription: {
-        type: "string",
-      },
-      description: {
-        type: "string",
-      },
-      table: {
-        type: "array",
-        items: {
+  let result: MediaPreprocessingResult;
+  let googleUsage: GenerateContentResponse["usageMetadata"] | undefined;
+
+  if (provider === "groq") {
+    try {
+      const processed = await preprocessWithGroq(
+        bytes,
+        mimeType,
+        processingMediaType,
+        content.file.name || "arquivo",
+        prompt,
+        config,
+        apiKey,
+        model,
+        transcriptionModel,
+        imageUrl,
+      );
+      result = processed.result;
+    } catch (error) {
+      return log_update_and_respond(
+        "error",
+        `Groq API error in preprocessing. Skipping preprocessing. ${error}`,
+      );
+    }
+  } else {
+    const genai = new GoogleGenAI({ apiKey });
+    const base64File = encodeBase64(bytes);
+    const responseSchema = {
+      type: "object",
+      properties: {
+        transcription: { type: "string" },
+        description: { type: "string" },
+        table: {
           type: "array",
-          items: {
-            type: "string",
-          },
+          items: { type: "array", items: { type: "string" } },
         },
       },
-    },
-  };
+    };
+    const contents: Array<
+      | { text: string }
+      | { inlineData: { mimeType: string; data: string } }
+    > = [{ inlineData: { mimeType, data: base64File } }];
 
-  const contents: Array<
-    | {
-      text: string;
+    if (mediaType === "image") {
+      contents.push({ text: prompt });
+    } else {
+      contents.unshift({ text: prompt });
     }
-    | {
-      inlineData: { mimeType: string; data: string };
-    }
-  > = [
-    {
-      inlineData: {
-        mimeType: mimeType,
-        data: base64File,
-      },
-    },
-  ];
 
-  if (mediaType === "image") {
-    // Documentation recommends to put the prompt at the end for images
-    contents.push({ text: prompt });
-  } else {
-    contents.unshift({ text: prompt });
-  }
+    let response: GenerateContentResponse;
+    try {
+      response = await genai.models.generateContent({
+        model,
+        contents,
+        config: {
+          responseMimeType: "application/json",
+          responseSchema,
+        },
+      });
+    } catch (error) {
+      const status = (error as ApiError).status;
+      if (status === 429) {
+        const message = String(error);
+        const isQuotaExhausted = message.includes("quota") ||
+          message.includes("RESOURCE_EXHAUSTED");
 
-  let response: GenerateContentResponse;
-
-  try {
-    response = await genai.models.generateContent({
-      model,
-      contents: contents,
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: responseSchema,
-      },
-    });
-  } catch (error) {
-    // https://ai.google.dev/gemini-api/docs/troubleshooting
-    const status = (error as ApiError).status;
-
-    // 429 can be rate limiting (retryable) or quota exhaustion (not retryable)
-    if (status === 429) {
-      const message = String(error);
-      const isQuotaExhausted = message.includes("quota") ||
-        message.includes("RESOURCE_EXHAUSTED");
-
-      if (isQuotaExhausted) {
-        return log_update_and_respond(
-          "warn",
-          `Gemini API quota exhausted for ${model}. Skipping preprocessing.`,
-        );
+        if (isQuotaExhausted) {
+          return log_update_and_respond(
+            "warn",
+            `Gemini API quota exhausted for ${model}. Skipping preprocessing.`,
+          );
+        }
       }
+
+      if ([429, 500, 503].includes(status)) {
+        log.error("Retryable Gemini API error in preprocessing", error);
+        throw error;
+      }
+
+      return log_update_and_respond(
+        "error",
+        `Gemini API error in preprocessing. Skipping preprocessing. ${error}`,
+      );
     }
 
-    // 500, 503: transient server errors worth retrying
-    if ([429, 500, 503].includes(status)) {
-      log.error("Retryable Gemini API error in preprocessing", error);
-      throw error;
+    googleUsage = response.usageMetadata;
+    if (!response?.text) {
+      return log_update_and_respond(
+        "error",
+        "No response text received from the preprocessing model. Skipping preprocessing.",
+      );
     }
 
-    return log_update_and_respond(
-      "error",
-      `Gemini API error in preprocessing. Skipping preprocessing. ${error}`,
-    );
+    try {
+      result = JSON.parse(response.text);
+    } catch (_error) {
+      return log_update_and_respond(
+        "error",
+        "Failed to parse the response text from the preprocessing model into a JSON object. Skipping preprocessing.",
+      );
+    }
   }
 
-  // Record AI usage in the ledger
-  if (response.usageMetadata) {
+  if (googleUsage) {
     let cost = 0;
 
     if (costs) {
       cost = calculateCost(
-        response.usageMetadata,
+        googleUsage,
         costs.pricing as Record<string, number>,
         costs.quantity,
       );
@@ -463,31 +676,9 @@ Deno.serve(async (req) => {
         provider: "google",
         model,
         billable,
-        metadata: response.usageMetadata as Json,
+        metadata: googleUsage as Json,
       })
       .throwOnError();
-  }
-
-  if (!response?.text) {
-    return log_update_and_respond(
-      "error",
-      "No response text received from the preprocessing model. Skipping preprocessing.",
-    );
-  }
-
-  let result: {
-    transcription: string | undefined;
-    description: string | undefined;
-    table: Array<Array<string>> | undefined;
-  };
-
-  try {
-    result = JSON.parse(response.text);
-  } catch (_error) {
-    return log_update_and_respond(
-      "error",
-      "Failed to parse the response text from the preprocessing model into a JSON object. Skipping preprocessing.",
-    );
   }
 
   const artifacts: Part[] = [];

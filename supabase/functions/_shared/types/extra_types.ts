@@ -8,9 +8,23 @@ export type Memory = {
   [key: string]: string | undefined | Memory;
 };
 
+export type PreprocessingProvider = "google" | "groq";
+
+export type PreprocessingVisionModel =
+  | "gemini-2.5-pro"
+  | "gemini-2.5-flash"
+  | "qwen/qwen3.6-27b"
+  | "qwen/qwen3.8-27b";
+
+export type PreprocessingTranscriptionModel =
+  | "whisper-large-v3-turbo"
+  | "whisper-large-v3";
+
 export type PreprocessingConfig = {
   mode?: "active" | "inactive";
-  model?: "gemini-2.5-pro" | "gemini-2.5-flash";
+  provider?: PreprocessingProvider;
+  model?: PreprocessingVisionModel;
+  transcription_model?: PreprocessingTranscriptionModel;
   api_key?: string;
   language?: string;
   extra_prompt?: string;
