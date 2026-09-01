@@ -1147,7 +1147,7 @@ async function recoverStaleProcessingDocuments(
         "O processamento foi interrompido antes de concluir. Tente processar novamente.",
     })
     .eq("organization_id", organizationId)
-    .eq("status", "processing")
+    .in("status", ["pending", "processing"])
     .lt("updated_at", cutoff);
   if (baseId) query = query.eq("knowledge_base_id", baseId);
   const { error } = await query;
