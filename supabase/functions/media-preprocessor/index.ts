@@ -403,6 +403,11 @@ Deno.serve(async (req) => {
     audio: [
       "audio/wav",
       "audio/mp3",
+      "audio/mpeg",
+      "audio/mp4",
+      "audio/webm",
+      "audio/opus",
+      "audio/amr",
       "audio/aiff",
       "audio/aac",
       "audio/ogg",
