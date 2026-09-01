@@ -25,6 +25,10 @@ const MAX_SYNTHESIS_SOURCE = 140_000;
 const CHUNK_SIZE = 1_200;
 const CHUNK_OVERLAP = 160;
 const KNOWLEDGE_GEMINI_MODEL = "gemini-2.5-flash";
+const MAX_PDF_TEXT_STREAM_BYTES = 512_000;
+const MAX_PDF_DECOMPRESSED_STREAM_BYTES = 4_000_000;
+const MAX_PDF_OPERATOR_SOURCE_BYTES = 1_000_000;
+const MAX_PDF_EXTRACTION_MS = 3_000;
 
 type AppEnv = ManagementEnv;
 type KnowledgeDocumentInput = {
@@ -376,16 +380,19 @@ function decodePdfHex(value: string): string {
 }
 
 function extractPdfOperators(source: string): string {
+  const boundedSource = source.length > MAX_PDF_OPERATOR_SOURCE_BYTES
+    ? source.slice(0, MAX_PDF_OPERATOR_SOURCE_BYTES)
+    : source;
   const parts: string[] = [];
   const textPattern = /\(((?:\\.|[^\\)])*)\)\s*(?:Tj|['"])/g;
-  for (const match of source.matchAll(textPattern)) {
+  for (const match of boundedSource.matchAll(textPattern)) {
     const text = decodePdfLiteral(match[1] ?? "").trim();
     if (text) parts.push(text);
   }
 
   const arrayPattern = /\[([\s\S]*?)\]\s*TJ/g;
   const tokenPattern = /\(((?:\\.|[^\\)])*)\)|<([\da-fA-F\s]+)>/g;
-  for (const match of source.matchAll(arrayPattern)) {
+  for (const match of boundedSource.matchAll(arrayPattern)) {
     const values: string[] = [];
     for (const token of (match[1] ?? "").matchAll(tokenPattern)) {
       const text = token[1] !== undefined
@@ -404,17 +411,39 @@ async function inflatePdfStream(bytes: Uint8Array): Promise<Uint8Array> {
   const writer = decompressor.writable.getWriter();
   await writer.write(bytes as unknown as Uint8Array<ArrayBuffer>);
   await writer.close();
-  return new Uint8Array(
-    await new Response(decompressor.readable).arrayBuffer(),
-  ) as unknown as Uint8Array;
+  const reader = decompressor.readable.getReader();
+  const parts: Uint8Array[] = [];
+  let total = 0;
+
+  while (true) {
+    const result = await reader.read();
+    if (result.done) break;
+    const part = result.value as Uint8Array;
+    total += part.byteLength;
+    if (total > MAX_PDF_DECOMPRESSED_STREAM_BYTES) {
+      await reader.cancel();
+      throw new Error("O conteúdo comprimido do PDF excede o limite de leitura");
+    }
+    parts.push(part);
+  }
+
+  const output = new Uint8Array(total);
+  let offset = 0;
+  for (const part of parts) {
+    output.set(part, offset);
+    offset += part.byteLength;
+  }
+  return output;
 }
 
 async function extractPdfText(bytes: Uint8Array): Promise<string> {
   const source = bytesAsBinary(bytes);
   const streamTexts: string[] = [];
   let cursor = 0;
+  const startedAt = Date.now();
 
   while (true) {
+    if (Date.now() - startedAt > MAX_PDF_EXTRACTION_MS) break;
     const marker = source.indexOf("stream", cursor);
     if (marker < 0) break;
     const end = source.indexOf("endstream", marker + 6);
@@ -439,6 +468,17 @@ async function extractPdfText(bytes: Uint8Array): Promise<string> {
       dataEnd--;
     }
 
+    const subtype = dictionary.match(/\/Subtype\s*\/([A-Za-z0-9]+)/i)?.[1]
+      ?.toLowerCase();
+    const isBinaryAsset = (subtype && subtype !== "form") ||
+      /\/Type\s*\/Metadata\b/i.test(dictionary) ||
+      /\/Filter\s*(?:\[[^\]]*(?:DCTDecode|JPXDecode)|\/(?:DCTDecode|JPXDecode)\b)/i
+        .test(dictionary);
+    if (isBinaryAsset || dataEnd - dataStart > MAX_PDF_TEXT_STREAM_BYTES) {
+      cursor = end + 9;
+      continue;
+    }
+
     let stream = bytes.slice(dataStart, dataEnd);
     if (/\/FlateDecode\b/.test(dictionary)) {
       try {
@@ -453,7 +493,9 @@ async function extractPdfText(bytes: Uint8Array): Promise<string> {
     cursor = end + 9;
   }
 
-  const rawText = extractPdfOperators(source);
+  const rawText = /\bBT\b|\bTj\b|\bTJ\b/.test(source)
+    ? extractPdfOperators(source)
+    : "";
   const streamedText = streamTexts.join("\n");
   return normalizeText(
     streamedText.length > rawText.length ? streamedText : rawText,
@@ -518,7 +560,7 @@ async function extractFile(
     if (text.length >= 20) return { text, method: "pdf-text" };
     if (!apiKey) {
       throw new Error(
-        "Este PDF parece ser escaneado. Configure uma chave Google/Gemini para leitura visual",
+        "Não encontrei texto selecionável neste PDF. Para ler PDFs escaneados ou diagramados, configure uma chave Google/Gemini em Configurações > Pré-processamento de mídia",
       );
     }
     return await extractWithGemini(bytes, mimeType, fileName, apiKey, model);
