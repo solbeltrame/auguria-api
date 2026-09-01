@@ -77,6 +77,8 @@ const MEDIA_PREPROCESSING_TIMEOUT = 30 * 1000; // 30 seconds
 const MEDIA_PREPROCESSING_POLLING_INTERVAL = 5 * 1000; // 5 seconds
 const MEMORY_KEY_MAX_LENGTH = 80;
 const MEMORY_VALUE_MAX_LENGTH = 500;
+const MEMORY_MAX_ENTRIES = 50;
+const MEMORY_MAX_SERIALIZED_LENGTH = 12_000;
 const MEMORY_KEY_SENSITIVE_PATTERN =
   /(?:password|senha|secret|token|api[_ -]?key|chave[_ -]?api|cvv|credit[_ -]?card|cart[aã]o)/i;
 
@@ -125,6 +127,16 @@ function normalizeMemoryValue(value: unknown): string {
     throw new Error("O valor da memória deve ter entre 1 e 500 caracteres");
   }
   return normalized;
+}
+
+function validateMemorySize(memory: Memory): void {
+  const serialized = JSON.stringify(memory);
+  if (Object.keys(memoryObject(memory)).length > MEMORY_MAX_ENTRIES) {
+    throw new Error("A memória atingiu o limite de 50 itens");
+  }
+  if (serialized.length > MEMORY_MAX_SERIALIZED_LENGTH) {
+    throw new Error("A memória atingiu o limite de tamanho permitido");
+  }
 }
 
 function collectKnowledgeText(part: unknown, output: string[]): void {
@@ -654,6 +666,7 @@ Deno.serve(async (req) => {
   let shouldContinue = true;
 
   const persistMemory = async (nextMemory: Memory): Promise<Memory> => {
+    validateMemorySize(nextMemory);
     const { data: latest } = await client
       .from("conversations")
       .select("extra")
