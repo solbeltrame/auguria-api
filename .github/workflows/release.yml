@@ -33,6 +33,7 @@ jobs:
 
       - run: supabase link --project-ref $SUPABASE_PROJECT_ID
       - run: supabase db push
+      - run: supabase secrets set SUPABASE_SERVICE_ROLE_KEY="$SUPABASE_SERVICE_ROLE_KEY"
       - run: supabase functions deploy
 
       - run: sudo apt-get update && sudo apt-get install -y postgresql-client
