@@ -28,6 +28,8 @@ import {
 } from "../_shared/groq.ts";
 import { renderPdfPages } from "../_shared/pdf-renderer.ts";
 
+const MAX_GROQ_PDF_RENDER_DIMENSION = 1_200;
+
 type ModalityTokenCount = { modality: string; tokenCount: number };
 
 type MediaPreprocessingResult = {
@@ -187,7 +189,11 @@ async function preprocessWithGroq(
   }
 
   if (mimeType === "application/pdf") {
-    const rendered = await renderPdfPages(bytes);
+    const rendered = await renderPdfPages(
+      bytes,
+      undefined,
+      MAX_GROQ_PDF_RENDER_DIMENSION,
+    );
     const sections: string[] = [];
     const usages: Record<string, unknown>[] = [];
     for (let index = 0; index < rendered.images.length; index += 3) {

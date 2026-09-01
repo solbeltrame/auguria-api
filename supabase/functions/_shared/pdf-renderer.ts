@@ -161,6 +161,7 @@ async function encodePng(
 export async function renderPdfPages(
   bytes: Uint8Array,
   requestedPages = MAX_RENDER_PAGES,
+  maxDimension = MAX_RENDER_DIMENSION,
 ): Promise<{ images: Uint8Array[]; pageCount: number; renderedPages: number }> {
   const pdfium = await getPdfium();
   const memory = pdfium.pdfium.wasmExports;
@@ -197,7 +198,7 @@ export async function renderPdfPages(
         );
         const scale = Math.min(
           1.75,
-          MAX_RENDER_DIMENSION / Math.max(pageWidth, pageHeight),
+          Math.max(1, maxDimension) / Math.max(pageWidth, pageHeight),
         );
         const width = Math.max(1, Math.round(pageWidth * scale));
         const height = Math.max(1, Math.round(pageHeight * scale));

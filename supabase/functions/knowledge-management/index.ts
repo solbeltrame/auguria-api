@@ -36,6 +36,7 @@ const KNOWLEDGE_GEMINI_MODEL = "gemini-2.5-flash";
 const KNOWLEDGE_GROQ_MODEL = "qwen/qwen3.6-27b";
 const KNOWLEDGE_GROQ_TRANSCRIPTION_MODEL = "whisper-large-v3-turbo";
 const MAX_GROQ_PDF_PAGES = 6;
+const MAX_GROQ_PDF_RENDER_DIMENSION = 1_200;
 const MAX_PDF_TEXT_STREAM_BYTES = 512_000;
 const MAX_PDF_DECOMPRESSED_STREAM_BYTES = 4_000_000;
 const MAX_PDF_OPERATOR_SOURCE_BYTES = 1_000_000;
@@ -640,7 +641,11 @@ async function extractWithGroq(
   }
 
   if (mimeType === "application/pdf") {
-    const rendered = await renderPdfPages(bytes, MAX_GROQ_PDF_PAGES);
+    const rendered = await renderPdfPages(
+      bytes,
+      MAX_GROQ_PDF_PAGES,
+      MAX_GROQ_PDF_RENDER_DIMENSION,
+    );
     const sections: string[] = [];
     for (let index = 0; index < rendered.images.length; index += 3) {
       const batch = rendered.images.slice(index, index + 3).map((image) => ({
