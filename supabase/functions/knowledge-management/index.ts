@@ -786,7 +786,7 @@ async function withTimeout<T>(
   try {
     return await Promise.race([work, deadline]);
   } finally {
-    if (timeout) clearTimeout(timeout);
+    if (timeout !== undefined) clearTimeout(timeout);
   }
 }
 
