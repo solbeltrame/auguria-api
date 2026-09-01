@@ -37,6 +37,7 @@ const KNOWLEDGE_GROQ_MODEL = "qwen/qwen3.6-27b";
 const KNOWLEDGE_GROQ_TRANSCRIPTION_MODEL = "whisper-large-v3-turbo";
 const MAX_GROQ_PDF_PAGES = 6;
 const MAX_GROQ_PDF_RENDER_DIMENSION = 1_200;
+const MAX_GROQ_IMAGE_DIMENSION = 1_600;
 const STALE_PROCESSING_MS = 5 * 60 * 1_000;
 const MAX_PDF_TEXT_STREAM_BYTES = 512_000;
 const MAX_PDF_DECOMPRESSED_STREAM_BYTES = 4_000_000;
@@ -852,9 +853,27 @@ async function downloadDocumentSource(document: KnowledgeDocumentRow): Promise<{
     throw downloadError || new Error("Arquivo não encontrado");
   }
   const bytes = new Uint8Array(await file.arrayBuffer());
-  const { data: signed } = await client.storage
+  const sourceMimeType = mimeFromName(document.file_name, document.mime_type);
+  const transform = sourceMimeType.startsWith("image/")
+    ? {
+      width: MAX_GROQ_IMAGE_DIMENSION,
+      height: MAX_GROQ_IMAGE_DIMENSION,
+      quality: 75,
+    }
+    : undefined;
+  const { data: signed, error: signedError } = await client.storage
     .from("knowledge")
-    .createSignedUrl(document.storage_path, 600);
+    .createSignedUrl(
+      document.storage_path,
+      600,
+      transform ? { transform } : undefined,
+    );
+  if (signedError) {
+    log.warn("Could not create transformed knowledge source URL", {
+      document_id: document.id,
+      error: signedError,
+    });
+  }
   return { bytes, mimeType: document.mime_type, sourceUrl: signed?.signedUrl };
 }
 
