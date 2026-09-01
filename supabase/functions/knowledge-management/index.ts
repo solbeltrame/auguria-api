@@ -38,6 +38,7 @@ const KNOWLEDGE_GROQ_TRANSCRIPTION_MODEL = "whisper-large-v3-turbo";
 const MAX_GROQ_PDF_PAGES = 6;
 const MAX_GROQ_PDF_RENDER_DIMENSION = 1_200;
 const MAX_GROQ_IMAGE_DIMENSION = 1_600;
+const MAX_DOCUMENT_EXTRACTION_MS = 100_000;
 const STALE_PROCESSING_MS = 5 * 60 * 1_000;
 const MAX_PDF_TEXT_STREAM_BYTES = 512_000;
 const MAX_PDF_DECOMPRESSED_STREAM_BYTES = 4_000_000;
@@ -773,6 +774,22 @@ async function extractFile(
   throw new Error(`Formato não suportado sem Google/Gemini: ${mimeType}`);
 }
 
+async function withTimeout<T>(
+  work: Promise<T>,
+  timeoutMs: number,
+  message: string,
+): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timeout = setTimeout(() => reject(new Error(message)), timeoutMs);
+  });
+  try {
+    return await Promise.race([work, deadline]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
 async function organizationMediaConfig(
   organizationId: string,
 ): Promise<MediaConfig> {
@@ -895,11 +912,15 @@ async function processDocument(
     }
 
     const config = await organizationMediaConfig(document.organization_id);
-    const extraction = await extractFile(
-      bytes,
-      document.file_name,
-      source.mimeType,
-      { ...config, imageUrl: source.sourceUrl },
+    const extraction = await withTimeout(
+      extractFile(
+        bytes,
+        document.file_name,
+        source.mimeType,
+        { ...config, imageUrl: source.sourceUrl },
+      ),
+      MAX_DOCUMENT_EXTRACTION_MS,
+      "A interpretação excedeu o limite de tempo. Tente processar novamente ou reduza o arquivo.",
     );
     const chunks = splitIntoChunks(extraction.text);
     if (!chunks.length) {
