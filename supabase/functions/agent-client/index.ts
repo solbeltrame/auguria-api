@@ -26,9 +26,11 @@ import Ajv2020 from "ajv";
 import type {
   AgentRowWithExtra,
   ContactInfo,
+  RequestContext,
   ResponseContext,
 } from "./protocols/base.ts";
 import { getFileMetadata } from "../_shared/media.ts";
+import type { SupabaseClient } from "@supabase/supabase-js";
 
 const sanitizeLabel = (label: string) => {
   return label
@@ -72,6 +74,114 @@ const MESSAGES_QUANTITY_LIMIT = 50;
 const RESPONSE_DELAY_SECS = 3; // 3 seconds
 const MEDIA_PREPROCESSING_TIMEOUT = 30 * 1000; // 30 seconds
 const MEDIA_PREPROCESSING_POLLING_INTERVAL = 5 * 1000; // 5 seconds
+
+function collectKnowledgeText(part: unknown, output: string[]): void {
+  if (!part || typeof part !== "object") return;
+
+  const candidate = part as { text?: unknown; artifacts?: unknown };
+  if (typeof candidate.text === "string") output.push(candidate.text);
+
+  if (Array.isArray(candidate.artifacts)) {
+    for (const artifact of candidate.artifacts) {
+      collectKnowledgeText(artifact, output);
+    }
+  }
+}
+
+function knowledgeQueryFromMessages(
+  messages: MessageRow[],
+  fromPeer: (message: MessageRow) => boolean,
+): string | undefined {
+  const latestPeerMessage = [...messages].reverse().find(fromPeer);
+  if (!latestPeerMessage) return undefined;
+
+  const parts: string[] = [];
+  collectKnowledgeText(latestPeerMessage.content, parts);
+
+  const query = parts
+    .join(" ")
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return query ? query.slice(0, 600) : undefined;
+}
+
+async function retrieveKnowledgeContext(
+  client: SupabaseClient<Database>,
+  organizationId: string,
+  agentId: string,
+  messages: MessageRow[],
+  fromPeer: (message: MessageRow) => boolean,
+): Promise<string | undefined> {
+  const queryText = knowledgeQueryFromMessages(messages, fromPeer);
+  if (!queryText) return undefined;
+
+  try {
+    const { data: activeBases } = await client
+      .from("knowledge_bases")
+      .select("id")
+      .eq("organization_id", organizationId)
+      .eq("status", "active")
+      .throwOnError();
+
+    if (!activeBases.length) return undefined;
+
+    const { data: linkedBases } = await client
+      .from("agent_knowledge_bases")
+      .select("knowledge_base_id")
+      .eq("organization_id", organizationId)
+      .eq("agent_id", agentId)
+      .throwOnError();
+
+    const activeIds = new Set(activeBases.map((base) => base.id));
+    const linkedIds = linkedBases
+      .map((link) => link.knowledge_base_id)
+      .filter((id) => activeIds.has(id));
+    const baseIds = linkedIds.length
+      ? linkedIds
+      : activeBases.map((base) => base.id);
+
+    const search = (term: string) =>
+      client
+        .from("knowledge_chunks")
+        .select("content, metadata")
+        .eq("organization_id", organizationId)
+        .in("knowledge_base_id", baseIds)
+        .textSearch("search_vector", term, {
+          type: "websearch",
+          config: "simple",
+        })
+        .limit(6);
+
+    let { data: matches } = await search(queryText).throwOnError();
+    if (!matches.length) {
+      const terms = queryText.split(/\s+/).filter((term) => term.length > 2);
+      if (terms.length > 1) {
+        ({ data: matches } = await search(terms.join(" OR ")).throwOnError());
+      }
+    }
+
+    if (!matches.length) return undefined;
+
+    return matches.map((match, index) => {
+      const metadata = match.metadata && typeof match.metadata === "object" &&
+          !Array.isArray(match.metadata)
+        ? match.metadata as Record<string, unknown>
+        : {};
+      const source = typeof metadata.file_name === "string"
+        ? metadata.file_name
+        : `Trecho ${index + 1}`;
+      return `[${source}]\n${match.content}`;
+    }).join("\n\n");
+  } catch (error) {
+    log.warn(
+      "Knowledge retrieval failed; continuing without RAG context",
+      error,
+    );
+    return undefined;
+  }
+}
 
 /**
  * timestamp vs created_at
@@ -132,8 +242,7 @@ function getNewestIncomingMessage(
   return sortedMessages[0];
 }
 
-const SERVICE_ROLE_KEY =
-  Deno.env.get("AUGURIA_EDGE_FUNCTIONS_TOKEN") ??
+const SERVICE_ROLE_KEY = Deno.env.get("AUGURIA_EDGE_FUNCTIONS_TOKEN") ??
   Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
 
 Deno.serve(async (req) => {
@@ -456,7 +565,7 @@ Deno.serve(async (req) => {
     agent.extra = {};
   }
 
-  const context = {
+  const context: RequestContext = {
     organization,
     conversation,
     messages,
@@ -550,6 +659,14 @@ Deno.serve(async (req) => {
           }
         }
       }
+
+      context.knowledgeContext = await retrieveKnowledgeContext(
+        client,
+        organization_id,
+        agent.id,
+        messages,
+        fromPeer,
+      );
 
       // CHECK IF THERE IS A NEWER INCOMING MESSAGE (posterior to the incoming one)
 

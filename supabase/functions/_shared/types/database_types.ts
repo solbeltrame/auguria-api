@@ -23,6 +23,54 @@ export type { Json, Tables };
 
 type AgentExtra = AIAgentExtra;
 
+type KnowledgeBaseRowShape = {
+  id: string;
+  organization_id: string;
+  name: string;
+  description: string | null;
+  status: "active" | "archived";
+  created_by: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+type KnowledgeDocumentRowShape = {
+  id: string;
+  organization_id: string;
+  knowledge_base_id: string;
+  file_name: string;
+  mime_type: string;
+  storage_path: string;
+  file_size: number;
+  status: "pending" | "processing" | "ready" | "error";
+  extracted_text: string | null;
+  error_message: string | null;
+  metadata: Json;
+  created_by: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+type KnowledgeChunkRowShape = {
+  id: string;
+  organization_id: string;
+  knowledge_base_id: string;
+  document_id: string;
+  chunk_index: number;
+  content: string;
+  search_vector: string;
+  embedding: number[] | null;
+  metadata: Json;
+  created_at: string;
+};
+
+type AgentKnowledgeBaseRowShape = {
+  organization_id: string;
+  agent_id: string;
+  knowledge_base_id: string;
+  created_at: string;
+};
+
 export type Database = MergeDeep<
   DatabaseGenerated,
   {
@@ -102,6 +150,65 @@ export type Database = MergeDeep<
             extra?: AgentExtra;
           };
         };
+        knowledge_bases: {
+          Row: KnowledgeBaseRowShape;
+          Insert: {
+            id?: string;
+            organization_id: string;
+            name: string;
+            description?: string | null;
+            status?: KnowledgeBaseRowShape["status"];
+            created_by?: string | null;
+            created_at?: string;
+            updated_at?: string;
+          };
+          Update: Partial<KnowledgeBaseRowShape>;
+          Relationships: [];
+        };
+        knowledge_documents: {
+          Row: KnowledgeDocumentRowShape;
+          Insert: {
+            id?: string;
+            organization_id: string;
+            knowledge_base_id: string;
+            file_name: string;
+            mime_type: string;
+            storage_path: string;
+            file_size?: number;
+            status?: KnowledgeDocumentRowShape["status"];
+            extracted_text?: string | null;
+            error_message?: string | null;
+            metadata?: Json;
+            created_by?: string | null;
+            created_at?: string;
+            updated_at?: string;
+          };
+          Update: Partial<KnowledgeDocumentRowShape>;
+          Relationships: [];
+        };
+        knowledge_chunks: {
+          Row: KnowledgeChunkRowShape;
+          Insert: {
+            organization_id: string;
+            knowledge_base_id: string;
+            document_id: string;
+            chunk_index: number;
+            content: string;
+            embedding?: number[] | null;
+            metadata?: Json;
+            id?: string;
+            search_vector?: string;
+            created_at?: string;
+          };
+          Update: Partial<KnowledgeChunkRowShape>;
+          Relationships: [];
+        };
+        agent_knowledge_bases: {
+          Row: AgentKnowledgeBaseRowShape;
+          Insert: AgentKnowledgeBaseRowShape & { created_at?: string };
+          Update: Partial<AgentKnowledgeBaseRowShape>;
+          Relationships: [];
+        };
       };
     };
   }
@@ -123,6 +230,15 @@ export type ContactAddressInsert =
   Database["public"]["Tables"]["contacts_addresses"]["Insert"];
 
 export type AgentRow = Database["public"]["Tables"]["agents"]["Row"];
+
+export type KnowledgeBaseRow =
+  Database["public"]["Tables"]["knowledge_bases"]["Row"];
+export type KnowledgeDocumentRow =
+  Database["public"]["Tables"]["knowledge_documents"]["Row"];
+export type KnowledgeChunkRow =
+  Database["public"]["Tables"]["knowledge_chunks"]["Row"];
+export type AgentKnowledgeBaseRow =
+  Database["public"]["Tables"]["agent_knowledge_bases"]["Row"];
 
 export type OrganizationAddressRow =
   Database["public"]["Tables"]["organizations_addresses"]["Row"];

@@ -7,6 +7,7 @@ export {
   createUnsecureClient,
 } from "./supabase_client.ts";
 export type {
+  AgentKnowledgeBaseRow,
   AgentRow,
   ApiKeyRow,
   ContactAddressInsert,
@@ -14,6 +15,9 @@ export type {
   ConversationRow,
   Database,
   Json,
+  KnowledgeBaseRow,
+  KnowledgeChunkRow,
+  KnowledgeDocumentRow,
   MessageInsert,
   MessageRow,
   MessageUpdate,

@@ -54,6 +54,11 @@ verify_jwt = false
 import_map = "./functions/deno.json"
 entrypoint = "./functions/agent-client/index.ts"
 
+[functions.knowledge-management]
+verify_jwt = false
+import_map = "./functions/deno.json"
+entrypoint = "./functions/knowledge-management/index.ts"
+
 [functions.whatsapp-dispatcher]
 verify_jwt = false
 import_map = "./functions/deno.json"

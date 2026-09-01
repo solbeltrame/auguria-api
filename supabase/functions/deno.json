@@ -30,6 +30,8 @@
     "openai/resources/chat/completions": "npm:openai@^5.12.2/resources/chat/completions",
     "@std/encoding/base64url": "jsr:@std/encoding@1.0.10/base64url",
     "dayjs": "npm:dayjs@^1.11.10",
-    "dayjs/plugin/utc": "npm:dayjs@^1.11.10/plugin/utc.js"
+    "dayjs/plugin/utc": "npm:dayjs@^1.11.10/plugin/utc.js",
+    "jszip": "npm:jszip@3.10.1",
+    "pdfjs-dist": "npm:pdfjs-dist@4.10.38"
   }
 }
