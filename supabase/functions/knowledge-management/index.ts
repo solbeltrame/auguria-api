@@ -11,7 +11,6 @@ import {
   groqTranscribe,
   groqVision,
   groqVisionBatch,
-  groqVisionUrl,
 } from "../_shared/groq.ts";
 import { renderPdfPages } from "../_shared/pdf-renderer.ts";
 import {
@@ -37,7 +36,8 @@ const KNOWLEDGE_GROQ_MODEL = "qwen/qwen3.6-27b";
 const KNOWLEDGE_GROQ_TRANSCRIPTION_MODEL = "whisper-large-v3-turbo";
 const MAX_GROQ_PDF_PAGES = 6;
 const MAX_GROQ_PDF_RENDER_DIMENSION = 1_200;
-const MAX_GROQ_IMAGE_DIMENSION = 1_600;
+const MAX_GROQ_IMAGE_DIMENSION = 1_200;
+const MAX_GROQ_IMAGE_OUTPUT_TOKENS = 6_000;
 const MAX_DOCUMENT_EXTRACTION_MS = 100_000;
 const STALE_PROCESSING_MS = 5 * 60 * 1_000;
 const MAX_PDF_TEXT_STREAM_BYTES = 512_000;
@@ -549,6 +549,34 @@ function isAiMedia(mimeType: string): boolean {
     mimeType.startsWith("video/");
 }
 
+async function fetchPreparedImage(
+  imageUrl: string | undefined,
+): Promise<{ bytes: Uint8Array; mimeType: string } | undefined> {
+  if (!imageUrl) return undefined;
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15_000);
+  try {
+    const response = await fetch(imageUrl, { signal: controller.signal });
+    if (!response.ok) {
+      log.warn("Could not download transformed knowledge image", {
+        status: response.status,
+      });
+      return undefined;
+    }
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    if (!bytes.length) return undefined;
+    const mimeType = response.headers.get("content-type")?.split(";", 1)[0]
+      ?.toLowerCase() || "";
+    return { bytes, mimeType };
+  } catch (error) {
+    log.warn("Could not download transformed knowledge image", { error });
+    return undefined;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 async function extractWithGemini(
   bytes: Uint8Array,
   mimeType: string,
@@ -607,27 +635,29 @@ async function extractWithGroq(
   }
 
   if (mimeType.startsWith("image/")) {
-    if (!["image/png", "image/jpeg", "image/webp"].includes(mimeType)) {
+    const prepared = await fetchPreparedImage(config.imageUrl);
+    const imageBytes = prepared?.bytes || bytes;
+    const imageMimeType = prepared?.mimeType || mimeType;
+    if (
+      !["image/png", "image/jpeg", "image/webp"].includes(imageMimeType)
+    ) {
       throw new Error(
-        `O Groq aceita imagens PNG, JPEG ou WebP; ${mimeType} precisa ser convertido antes do envio`,
+        `O Groq aceita imagens PNG, JPEG ou WebP; ${imageMimeType} precisa ser convertido antes do envio`,
       );
     }
     const prompt =
       `Leia e descreva esta imagem em português do Brasil. Extraia todo texto visível, valores, datas e tabelas de forma organizada. Arquivo: ${fileName}.`;
-    const response = config.imageUrl
-      ? await groqVisionUrl(
-        config.imageUrl,
-        prompt,
-        config.apiKey,
-        config.model,
-      )
-      : await groqVision(
-        bytes,
-        mimeType,
-        prompt,
-        config.apiKey,
-        config.model,
-      );
+    const response = await groqVision(
+      imageBytes,
+      imageMimeType,
+      prompt,
+      config.apiKey,
+      config.model,
+      {
+        maxCompletionTokens: MAX_GROQ_IMAGE_OUTPUT_TOKENS,
+        reasoningEffort: "none",
+      },
+    );
     return { text: normalizeText(response.text), method: "groq" };
   }
 
@@ -660,7 +690,10 @@ async function extractWithGroq(
         `Leia as páginas deste PDF na ordem apresentada. Extraia todo o texto visível, valores, datas e tabelas em Markdown, preservando a separação por página. Não invente conteúdo. Arquivo: ${fileName}.`,
         config.apiKey,
         config.model,
-        { maxCompletionTokens: 10_000 },
+        {
+          maxCompletionTokens: MAX_GROQ_IMAGE_OUTPUT_TOKENS,
+          reasoningEffort: "none",
+        },
       );
       sections.push(normalizeText(response.text));
     }
@@ -1067,6 +1100,7 @@ async function synthesizeInstructions(
           model: config.model,
           temperature: 0.15,
           maxCompletionTokens: 12_000,
+          reasoningEffort: "none",
         },
       );
       return normalizeInstructions(response.text) || fallback;

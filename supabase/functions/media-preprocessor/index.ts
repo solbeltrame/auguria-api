@@ -173,6 +173,7 @@ async function preprocessWithGroq(
     const response = imageUrl
       ? await groqVisionUrl(imageUrl, imagePrompt, apiKey, model, {
         json: true,
+        reasoningEffort: "none",
       })
       : await groqVision(
         bytes,
@@ -180,7 +181,7 @@ async function preprocessWithGroq(
         imagePrompt,
         apiKey,
         model,
-        { json: true },
+        { json: true, reasoningEffort: "none" },
       );
     return {
       result: parseModelJson(response.text) || { transcription: response.text },
@@ -205,7 +206,7 @@ async function preprocessWithGroq(
         `${prompt}\nLeia as páginas na ordem apresentada e preserve a separação por página. Responda em Markdown, sem inventar conteúdo.`,
         apiKey,
         model,
-        { maxCompletionTokens: 10_000 },
+        { maxCompletionTokens: 6_000, reasoningEffort: "none" },
       );
       sections.push(response.text);
       if (response.usage) usages.push(response.usage);
@@ -227,7 +228,13 @@ async function preprocessWithGroq(
     const response = await groqChat(
       [{ role: "user", content: `${prompt}\n\nCONTEÚDO DO ARQUIVO:\n${text}` }],
       apiKey,
-      { model, temperature: 0.1, maxCompletionTokens: 4_000, json: true },
+      {
+        model,
+        temperature: 0.1,
+        maxCompletionTokens: 4_000,
+        json: true,
+        reasoningEffort: "none",
+      },
     );
     return {
       result: parseModelJson(response.text) || { description: response.text },

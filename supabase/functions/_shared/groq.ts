@@ -3,6 +3,15 @@ import { encodeBase64 } from "jsr:@std/encoding/base64";
 const GROQ_API_URL = "https://api.groq.com/openai/v1";
 const DEFAULT_TIMEOUT_MS = 45_000;
 const MAX_INLINE_IMAGE_BYTES = 4 * 1000 * 1000;
+type GroqReasoningEffort = "none" | "default" | "low" | "medium" | "high";
+
+function encodedImageBytes(bytes: number): number {
+  return Math.ceil(bytes / 3) * 4;
+}
+
+function supportsNoReasoning(model: string): boolean {
+  return /^qwen\/qwen3\.[68](?:-|$)/i.test(model);
+}
 
 export type GroqUsage = Record<string, unknown>;
 
@@ -53,7 +62,15 @@ async function requestGroq(
       signal: controller.signal,
     });
     if (!response.ok) {
-      throw new Error(`Groq API respondeu HTTP ${response.status}`);
+      const detail = (await response.text().catch(() => ""))
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 240);
+      throw new Error(
+        `Groq API respondeu HTTP ${response.status}${
+          detail ? `: ${detail}` : ""
+        }`,
+      );
     }
     return response;
   } catch (error) {
@@ -74,6 +91,7 @@ export async function groqChat(
     temperature?: number;
     maxCompletionTokens?: number;
     json?: boolean;
+    reasoningEffort?: GroqReasoningEffort;
   },
 ): Promise<{ text: string; usage?: GroqUsage }> {
   if (!apiKey.trim()) throw new Error("Chave da API Groq não configurada");
@@ -84,6 +102,12 @@ export async function groqChat(
     max_completion_tokens: options.maxCompletionTokens ?? 4_000,
   };
   if (options.json) body.response_format = { type: "json_object" };
+  if (
+    options.reasoningEffort &&
+    (options.reasoningEffort !== "none" || supportsNoReasoning(options.model))
+  ) {
+    body.reasoning_effort = options.reasoningEffort;
+  }
 
   const response = await requestGroq(
     "/chat/completions",
@@ -106,11 +130,15 @@ export async function groqVision(
   prompt: string,
   apiKey: string,
   model: string,
-  options: { json?: boolean; maxCompletionTokens?: number } = {},
+  options: {
+    json?: boolean;
+    maxCompletionTokens?: number;
+    reasoningEffort?: GroqReasoningEffort;
+  } = {},
 ): Promise<{ text: string; usage?: GroqUsage }> {
-  if (bytes.byteLength > MAX_INLINE_IMAGE_BYTES) {
+  if (encodedImageBytes(bytes.byteLength) > MAX_INLINE_IMAGE_BYTES) {
     throw new Error(
-      "A imagem excede o limite de 4 MB para envio direto ao Groq; use uma URL assinada ou reduza o arquivo",
+      "A imagem excede o limite de 4 MB após codificação para o Groq; reduza o arquivo",
     );
   }
   return await groqChat(
@@ -132,6 +160,7 @@ export async function groqVision(
       temperature: 0.1,
       maxCompletionTokens: options.maxCompletionTokens ?? 8_000,
       json: options.json,
+      reasoningEffort: options.reasoningEffort,
     },
   );
 }
@@ -141,7 +170,11 @@ export async function groqVisionUrl(
   prompt: string,
   apiKey: string,
   model: string,
-  options: { json?: boolean; maxCompletionTokens?: number } = {},
+  options: {
+    json?: boolean;
+    maxCompletionTokens?: number;
+    reasoningEffort?: GroqReasoningEffort;
+  } = {},
 ): Promise<{ text: string; usage?: GroqUsage }> {
   return await groqChat(
     [{
@@ -157,6 +190,7 @@ export async function groqVisionUrl(
       temperature: 0.1,
       maxCompletionTokens: options.maxCompletionTokens ?? 8_000,
       json: options.json,
+      reasoningEffort: options.reasoningEffort,
     },
   );
 }
@@ -166,15 +200,22 @@ export async function groqVisionBatch(
   prompt: string,
   apiKey: string,
   model: string,
-  options: { maxCompletionTokens?: number } = {},
+  options: {
+    maxCompletionTokens?: number;
+    reasoningEffort?: GroqReasoningEffort;
+  } = {},
 ): Promise<{ text: string; usage?: GroqUsage }> {
   const content: GroqMessage["content"] = [{ type: "text", text: prompt }];
+  const totalBytes = images.reduce(
+    (total, image) => total + image.bytes.byteLength,
+    0,
+  );
+  if (encodedImageBytes(totalBytes) > MAX_INLINE_IMAGE_BYTES) {
+    throw new Error(
+      "As páginas renderizadas excedem o limite de 4 MB após codificação para o Groq",
+    );
+  }
   for (const image of images) {
-    if (image.bytes.byteLength > MAX_INLINE_IMAGE_BYTES) {
-      throw new Error(
-        "Uma das páginas renderizadas excede o limite de 4 MB para imagens em base64 no Groq",
-      );
-    }
     content.push({
       type: "image_url",
       image_url: {
@@ -189,6 +230,7 @@ export async function groqVisionBatch(
       model,
       temperature: 0.1,
       maxCompletionTokens: options.maxCompletionTokens ?? 8_000,
+      reasoningEffort: options.reasoningEffort,
     },
   );
 }
