@@ -845,6 +845,50 @@ app.post(
   },
 );
 
+app.post(
+  "/knowledge-management/documents/:id/reprocess",
+  requireRoles(["admin", "owner"]),
+  async (c) => {
+    const organizationId = requireText(
+      c.req.query("organization_id"),
+      "organization_id",
+      80,
+    );
+    const documentId = requireText(c.req.param("id"), "id", 80);
+    const client = createUnsecureClient();
+    const { data: document } = await client
+      .from("knowledge_documents")
+      .select()
+      .eq("id", documentId)
+      .eq("organization_id", organizationId)
+      .maybeSingle()
+      .throwOnError();
+
+    if (!document) {
+      throw new HTTPException(404, { message: "Knowledge document not found" });
+    }
+    if (document.status !== "error") {
+      throw new HTTPException(409, {
+        message: "Only documents with an error can be reprocessed",
+      });
+    }
+
+    try {
+      return c.json(await processDocument(document));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      log.error("Knowledge document reprocessing failed", {
+        document_id: document.id,
+        message,
+      });
+      return c.json(
+        { ...document, status: "error", error_message: message },
+        422,
+      );
+    }
+  },
+);
+
 app.delete(
   "/knowledge-management/documents/:id",
   requireRoles(["admin", "owner"]),
