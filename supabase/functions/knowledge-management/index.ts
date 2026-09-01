@@ -3,7 +3,6 @@ import { Hono } from "@hono/hono";
 import { cors } from "jsr:@hono/hono/cors";
 import { HTTPException } from "jsr:@hono/hono/http-exception";
 import JSZip from "npm:jszip@3.10.1";
-import { getDocument } from "npm:pdfjs-dist@4.10.38/legacy/build/pdf.mjs";
 import { GoogleGenAI } from "@google/genai";
 import { encodeBase64 } from "jsr:@std/encoding/base64";
 import * as log from "../_shared/logger.ts";
@@ -262,26 +261,156 @@ async function extractOfficeXml(bytes: Uint8Array): Promise<string> {
   return normalizeText(parts.join("\n"));
 }
 
-async function extractPdfText(bytes: Uint8Array): Promise<string> {
-  const document = await getDocument({
-    data: bytes,
-    disableFontFace: true,
-    isEvalSupported: false,
-    useWorkerFetch: false,
-  }).promise;
-  const pages: string[] = [];
+function bytesAsBinary(bytes: Uint8Array): string {
+  let value = "";
+  const chunkSize = 0x8000;
+  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+    value += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
+  }
+  return value;
+}
 
-  for (let pageNumber = 1; pageNumber <= document.numPages; pageNumber++) {
-    const page = await document.getPage(pageNumber);
-    const content = await page.getTextContent();
-    pages.push(
-      content.items
-        .map((item) => ("str" in item ? item.str : ""))
-        .join(" "),
-    );
+function decodePdfBytes(bytes: number[]): string {
+  if (bytes[0] === 0xfe && bytes[1] === 0xff) {
+    let value = "";
+    for (let index = 2; index + 1 < bytes.length; index += 2) {
+      value += String.fromCharCode((bytes[index] << 8) | bytes[index + 1]);
+    }
+    return value;
   }
 
-  return normalizeText(pages.join("\n"));
+  return new TextDecoder("windows-1252").decode(Uint8Array.from(bytes));
+}
+
+function decodePdfLiteral(value: string): string {
+  const bytes: number[] = [];
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    if (code !== 92) {
+      bytes.push(code & 0xff);
+      continue;
+    }
+
+    const next = value[index + 1];
+    if (!next) break;
+    const escapes: Record<string, number> = {
+      b: 8,
+      f: 12,
+      n: 10,
+      r: 13,
+      t: 9,
+    };
+    if (next in escapes) {
+      bytes.push(escapes[next]);
+      index++;
+      continue;
+    }
+
+    if (/[0-7]/.test(next)) {
+      const octal = value.slice(index + 1).match(/^[0-7]{1,3}/)?.[0] ?? "";
+      bytes.push(parseInt(octal, 8));
+      index += octal.length;
+      continue;
+    }
+
+    bytes.push(next.charCodeAt(0) & 0xff);
+    index++;
+  }
+  return decodePdfBytes(bytes);
+}
+
+function decodePdfHex(value: string): string {
+  const compact = value.replace(/\s/g, "");
+  const bytes: number[] = [];
+  for (let index = 0; index < compact.length; index += 2) {
+    bytes.push(parseInt(compact.slice(index, index + 2).padEnd(2, "0"), 16));
+  }
+  return decodePdfBytes(bytes);
+}
+
+function extractPdfOperators(source: string): string {
+  const parts: string[] = [];
+  const textPattern = /\(((?:\\.|[^\\)])*)\)\s*(?:Tj|['"])/g;
+  for (const match of source.matchAll(textPattern)) {
+    const text = decodePdfLiteral(match[1] ?? "").trim();
+    if (text) parts.push(text);
+  }
+
+  const arrayPattern = /\[([\s\S]*?)\]\s*TJ/g;
+  const tokenPattern = /\(((?:\\.|[^\\)])*)\)|<([\da-fA-F\s]+)>/g;
+  for (const match of source.matchAll(arrayPattern)) {
+    const values: string[] = [];
+    for (const token of (match[1] ?? "").matchAll(tokenPattern)) {
+      const text = token[1] !== undefined
+        ? decodePdfLiteral(token[1])
+        : decodePdfHex(token[2] ?? "");
+      if (text) values.push(text);
+    }
+    if (values.length) parts.push(values.join(" ").trim());
+  }
+
+  return parts.join(" ");
+}
+
+async function inflatePdfStream(bytes: Uint8Array): Promise<Uint8Array> {
+  const decompressor = new DecompressionStream("deflate");
+  const writer = decompressor.writable.getWriter();
+  await writer.write(bytes as unknown as Uint8Array<ArrayBuffer>);
+  await writer.close();
+  return new Uint8Array(
+    await new Response(decompressor.readable).arrayBuffer(),
+  ) as unknown as Uint8Array;
+}
+
+async function extractPdfText(bytes: Uint8Array): Promise<string> {
+  const source = bytesAsBinary(bytes);
+  const streamTexts: string[] = [];
+  let cursor = 0;
+
+  while (true) {
+    const marker = source.indexOf("stream", cursor);
+    if (marker < 0) break;
+    const end = source.indexOf("endstream", marker + 6);
+    if (end < 0) break;
+
+    const dictionaryStart = source.lastIndexOf("<<", marker);
+    const dictionary = dictionaryStart >= 0
+      ? source.slice(dictionaryStart, marker)
+      : "";
+    let dataStart = marker + 6;
+    while (
+      dataStart < end &&
+      (source[dataStart] === "\r" || source[dataStart] === "\n")
+    ) {
+      dataStart++;
+    }
+    let dataEnd = end;
+    while (
+      dataEnd > dataStart &&
+      (source[dataEnd - 1] === "\r" || source[dataEnd - 1] === "\n")
+    ) {
+      dataEnd--;
+    }
+
+    let stream = bytes.slice(dataStart, dataEnd);
+    if (/\/FlateDecode\b/.test(dictionary)) {
+      try {
+        stream = (await inflatePdfStream(stream)) as typeof stream;
+      } catch {
+        stream = bytes.slice(dataStart, dataEnd);
+      }
+    }
+
+    const text = extractPdfOperators(bytesAsBinary(stream));
+    if (text) streamTexts.push(text);
+    cursor = end + 9;
+  }
+
+  const rawText = extractPdfOperators(source);
+  const streamedText = streamTexts.join("\n");
+  return normalizeText(
+    streamedText.length > rawText.length ? streamedText : rawText,
+  );
 }
 
 function isGeminiMedia(mimeType: string): boolean {
