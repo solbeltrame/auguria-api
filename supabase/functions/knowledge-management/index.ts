@@ -939,6 +939,15 @@ async function processDocument(
   }
 }
 
+function scheduleInBackground(work: Promise<unknown>): boolean {
+  const runtime = globalThis as unknown as {
+    EdgeRuntime?: { waitUntil(promise: Promise<unknown>): void };
+  };
+  if (!runtime.EdgeRuntime?.waitUntil) return false;
+  runtime.EdgeRuntime.waitUntil(work);
+  return true;
+}
+
 type SynthesisDocument = Pick<
   KnowledgeDocumentRow,
   "title" | "file_name" | "extracted_text" | "source_type" | "source_url"
@@ -959,7 +968,9 @@ function sourceForSynthesis(
     if (!extracted) continue;
     const source = document.source_url ? `\nURL: ${document.source_url}` : "";
     sections.push(
-      `## Fonte: ${document.title || document.file_name}${source}\n${extracted.slice(0, 30_000)}`,
+      `## Fonte: ${document.title || document.file_name}${source}\n${
+        extracted.slice(0, 30_000)
+      }`,
     );
   }
 
@@ -1032,6 +1043,48 @@ async function synthesizeInstructions(
     log.warn("Knowledge synthesis failed; keeping compiled context", error);
     return fallback;
   }
+}
+
+async function refreshGeneratedContext(
+  organizationId: string,
+  baseId: string,
+): Promise<void> {
+  const client = createUnsecureClient();
+  const { data: documents } = await client
+    .from("knowledge_documents")
+    .select("title, file_name, extracted_text, source_type, source_url")
+    .eq("knowledge_base_id", baseId)
+    .eq("organization_id", organizationId)
+    .eq("status", "ready")
+    .eq("active", true)
+    .order("created_at", { ascending: true })
+    .throwOnError();
+  const mediaConfig = await organizationMediaConfig(organizationId);
+  const instructions = await synthesizeInstructions(documents, mediaConfig);
+  await client
+    .from("knowledge_bases")
+    .update({ generated_context: instructions })
+    .eq("id", baseId)
+    .eq("organization_id", organizationId)
+    .throwOnError();
+}
+
+async function processDocumentAndRefreshContext(
+  document: KnowledgeDocumentRow,
+): Promise<KnowledgeDocumentRow> {
+  const processed = await processDocument(document);
+  try {
+    await refreshGeneratedContext(
+      document.organization_id,
+      document.knowledge_base_id,
+    );
+  } catch (error) {
+    log.warn("Knowledge context refresh failed after document processing", {
+      document_id: document.id,
+      error,
+    });
+  }
+  return processed;
 }
 
 app.get(
@@ -1488,9 +1541,22 @@ app.post(
       .single()
       .throwOnError();
 
+    const processing = processDocumentAndRefreshContext(document);
+    if (
+      scheduleInBackground(
+        processing.catch((error) => {
+          log.error("Knowledge document background processing failed", {
+            document_id: document.id,
+            message: error instanceof Error ? error.message : String(error),
+          });
+        }),
+      )
+    ) {
+      return c.json(document, 202);
+    }
+
     try {
-      const processed = await processDocument(document);
-      return c.json(processed, 201);
+      return c.json(await processing, 201);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       log.error("Knowledge document processing failed", {
@@ -1533,8 +1599,25 @@ app.post(
       });
     }
 
+    const processing = processDocumentAndRefreshContext(document);
+    if (
+      scheduleInBackground(
+        processing.catch((error) => {
+          log.error("Knowledge document background reprocessing failed", {
+            document_id: document.id,
+            message: error instanceof Error ? error.message : String(error),
+          });
+        }),
+      )
+    ) {
+      return c.json(
+        { ...document, status: "pending", error_message: null },
+        202,
+      );
+    }
+
     try {
-      return c.json(await processDocument(document));
+      return c.json(await processing);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       log.error("Knowledge document reprocessing failed", {
