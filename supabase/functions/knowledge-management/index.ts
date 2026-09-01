@@ -144,8 +144,9 @@ function extension(fileName: string): string {
 
 function safeStorageFileName(fileName: string): string {
   const normalized = fileName
-    .normalize("NFKC")
-    .replace(/[^\p{L}\p{N}._-]+/gu, "-")
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-zA-Z0-9._-]+/g, "-")
     .replace(/^-+|-+$/g, "")
     .slice(0, 180);
   return normalized || "arquivo";
