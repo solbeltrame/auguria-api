@@ -1369,11 +1369,9 @@
       "npm:@slack/types@3",
       "npm:@slack/web-api@8",
       "npm:dayjs@^1.11.10",
-      "npm:jszip@3.10.1",
       "npm:mathjs@^11.10.0",
       "npm:mysql2@^3.14.3",
       "npm:openai@^5.12.2",
-      "npm:pdfjs-dist@4.10.38",
       "npm:postgres@^3.4.7",
       "npm:zod@^4.0.9"
     ]
