@@ -20,6 +20,8 @@ import {
 
 const MAX_FILE_SIZE = 20 * 1000 * 1000;
 const MAX_EXTRACTED_TEXT = 2_000_000;
+const MAX_INSTRUCTIONS = 60_000;
+const MAX_SYNTHESIS_SOURCE = 140_000;
 const CHUNK_SIZE = 1_200;
 const CHUNK_OVERLAP = 160;
 const KNOWLEDGE_GEMINI_MODEL = "gemini-2.5-flash";
@@ -28,7 +30,9 @@ type AppEnv = ManagementEnv;
 type KnowledgeDocumentInput = {
   organization_id?: string;
   knowledge_base_id?: string;
+  source_type?: "file" | "url";
   storage_path?: string;
+  source_url?: string;
   file_name?: string;
   mime_type?: string;
   file_size?: number;
@@ -101,8 +105,50 @@ function requireText(value: unknown, field: string, maxLength: number): string {
   return normalized;
 }
 
+function validateSourceUrl(value: unknown): string {
+  const sourceUrl = requireText(value, "source_url", 2_000);
+  let parsed: URL;
+  try {
+    parsed = new URL(sourceUrl);
+  } catch {
+    throw new HTTPException(400, { message: "source_url must be a valid URL" });
+  }
+
+  const hostname = parsed.hostname.toLowerCase();
+  const privateHost = hostname === "localhost" ||
+    hostname.endsWith(".localhost") ||
+    hostname.endsWith(".local") ||
+    hostname === "::1" ||
+    hostname.startsWith("127.") ||
+    hostname.startsWith("10.") ||
+    hostname.startsWith("192.168.") ||
+    /^172\.(1[6-9]|2\d|3[0-1])\./.test(hostname) ||
+    hostname.startsWith("169.254.");
+
+  if (!(["http:", "https:"].includes(parsed.protocol)) || privateHost) {
+    throw new HTTPException(400, {
+      message: "source_url must use a public HTTP or HTTPS address",
+    });
+  }
+  if (parsed.username || parsed.password) {
+    throw new HTTPException(400, {
+      message: "source_url cannot contain credentials",
+    });
+  }
+  return parsed.toString();
+}
+
 function extension(fileName: string): string {
   return fileName.split(".").pop()?.toLowerCase() ?? "";
+}
+
+function safeStorageFileName(fileName: string): string {
+  const normalized = fileName
+    .normalize("NFKC")
+    .replace(/[^\p{L}\p{N}._-]+/gu, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 180);
+  return normalized || "arquivo";
 }
 
 function mimeFromName(fileName: string, mimeType: string): string {
@@ -166,7 +212,7 @@ function decodeXml(value: string): string {
 
 function normalizeText(value: string): string {
   return value
-    .replace(/\u0000/g, "")
+    .replaceAll(String.fromCharCode(0), "")
     .replace(/\r\n/g, "\n")
     .replace(/[ \t]+/g, " ")
     .replace(/\n{3,}/g, "\n\n")
@@ -498,7 +544,10 @@ async function extractFile(
       fileExtension,
     )
   ) {
-    const text = normalizeText(new TextDecoder().decode(bytes));
+    const decoded = new TextDecoder().decode(bytes);
+    const text = normalizeText(
+      mimeType === "text/html" ? decodeXml(decoded) : decoded,
+    );
     if (!text) throw new Error("O arquivo de texto está vazio");
     return { text, method: "text" };
   }
@@ -531,6 +580,49 @@ async function organizationMediaConfig(organizationId: string): Promise<{
   };
 }
 
+async function downloadDocumentSource(document: KnowledgeDocumentRow): Promise<{
+  bytes: Uint8Array;
+  mimeType: string;
+}> {
+  if (document.source_type === "url") {
+    if (!document.source_url) throw new Error("A fonte não possui uma URL");
+    const response = await fetch(document.source_url, {
+      headers: { accept: "text/html,text/plain,application/json,*/*" },
+      redirect: "manual",
+    });
+    if (response.status >= 300 && response.status < 400) {
+      throw new Error("A URL redirecionou; cadastre o endereço final da fonte");
+    }
+    if (!response.ok) {
+      throw new Error(`A URL respondeu com HTTP ${response.status}`);
+    }
+    const contentLength = Number(response.headers.get("content-length") || 0);
+    if (contentLength > MAX_FILE_SIZE) {
+      throw new Error("O conteúdo remoto excede o limite de 20 MB");
+    }
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    if (bytes.length > MAX_FILE_SIZE) {
+      throw new Error("O conteúdo remoto excede o limite de 20 MB");
+    }
+    return {
+      bytes,
+      mimeType: response.headers.get("content-type")?.split(";", 1)[0] ||
+        document.mime_type,
+    };
+  }
+
+  if (!document.storage_path) throw new Error("O arquivo não possui storage");
+  const client = createUnsecureClient();
+  const { data: file, error: downloadError } = await client.storage
+    .from("knowledge")
+    .download(document.storage_path);
+  if (downloadError || !file) {
+    throw downloadError || new Error("Arquivo não encontrado");
+  }
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  return { bytes, mimeType: document.mime_type };
+}
+
 async function processDocument(
   document: KnowledgeDocumentRow,
 ): Promise<KnowledgeDocumentRow> {
@@ -542,13 +634,8 @@ async function processDocument(
       .eq("id", document.id)
       .throwOnError();
 
-    const { data: file, error: downloadError } = await client.storage
-      .from("knowledge")
-      .download(document.storage_path);
-    if (downloadError || !file) {
-      throw downloadError || new Error("Arquivo não encontrado");
-    }
-    const bytes = new Uint8Array(await file.arrayBuffer());
+    const source = await downloadDocumentSource(document);
+    const bytes = source.bytes;
     if (bytes.length > MAX_FILE_SIZE) {
       throw new Error("O arquivo excede o limite de 20 MB");
     }
@@ -557,7 +644,7 @@ async function processDocument(
     const extraction = await extractFile(
       bytes,
       document.file_name,
-      document.mime_type,
+      source.mimeType,
       config.apiKey,
       config.model,
     );
@@ -580,6 +667,7 @@ async function processDocument(
       content,
       metadata: {
         file_name: document.file_name,
+        ...(document.source_url && { source_url: document.source_url }),
         method: extraction.method,
       } as Json,
     }));
@@ -601,6 +689,7 @@ async function processDocument(
       .from("knowledge_documents")
       .update({
         status: "ready",
+        mime_type: source.mimeType,
         extracted_text: extraction.text,
         metadata,
         error_message: null,
@@ -621,6 +710,86 @@ async function processDocument(
   }
 }
 
+type SynthesisDocument = Pick<
+  KnowledgeDocumentRow,
+  "file_name" | "extracted_text" | "source_type" | "source_url"
+>;
+
+function normalizeInstructions(value: unknown): string {
+  if (typeof value !== "string") return "";
+  return value.trim().slice(0, MAX_INSTRUCTIONS);
+}
+
+function sourceForSynthesis(
+  documents: SynthesisDocument[],
+): string {
+  const sections: string[] = [];
+
+  for (const document of documents) {
+    const extracted = normalizeText(document.extracted_text ?? "");
+    if (!extracted) continue;
+    const source = document.source_url ? `\nURL: ${document.source_url}` : "";
+    sections.push(
+      `## Fonte: ${document.file_name}${source}\n${extracted.slice(0, 30_000)}`,
+    );
+  }
+
+  return sections.join("\n\n").slice(0, MAX_SYNTHESIS_SOURCE);
+}
+
+function compiledInstructions(
+  documents: SynthesisDocument[],
+): string {
+  const source = sourceForSynthesis(documents);
+  if (!source) return "";
+
+  return [
+    "# Contexto consolidado do negócio",
+    "",
+    "Use este documento como referência operacional. Preserve fatos, preços, horários, políticas e exceções. Quando algo não estiver aqui, peça confirmação em vez de inventar.",
+    "",
+    source,
+  ].join("\n").slice(0, MAX_INSTRUCTIONS);
+}
+
+async function synthesizeInstructions(
+  documents: SynthesisDocument[],
+  config: { apiKey?: string; model?: string },
+): Promise<string> {
+  const fallback = compiledInstructions(documents);
+  const source = sourceForSynthesis(documents);
+  if (!config.apiKey || !source) {
+    return fallback;
+  }
+
+  try {
+    const genai = new GoogleGenAI({ apiKey: config.apiKey });
+    const response = await genai.models.generateContent({
+      model: config.model || KNOWLEDGE_GEMINI_MODEL,
+      contents: [{
+        text: [
+          "Você é o editor da base de conhecimento de uma empresa.",
+          "Consolide as fontes abaixo em um único documento Markdown em português do Brasil para orientar um agente de atendimento.",
+          "Remova duplicações, preserve números, preços, nomes, horários, regras e exceções, e sinalize conflitos sem escolher um lado.",
+          "Não invente informações, não escreva prefácio nem explique o processo.",
+          "Organize o resultado em: identidade e escopo, produtos/serviços, políticas e regras, operação e atendimento, perguntas frequentes e casos de exceção.",
+          "\nFONTES:\n",
+          source,
+        ].join("\n"),
+      }],
+      config: {
+        temperature: 0.15,
+        maxOutputTokens: 12_000,
+      },
+    });
+    const generated = normalizeInstructions(response.text);
+    return generated || fallback;
+  } catch (error) {
+    log.warn("Knowledge synthesis failed; keeping compiled context", error);
+    return fallback;
+  }
+}
+
 app.get(
   "/knowledge-management/bases",
   requireRoles(["member", "admin", "owner"]),
@@ -634,6 +803,42 @@ app.get(
       .order("updated_at", { ascending: false })
       .throwOnError();
     return c.json(data);
+  },
+);
+
+app.post(
+  "/knowledge-management/bases/default",
+  requireRoles(["admin", "owner"]),
+  async (c) => {
+    const payload = await c.req.json<{ organization_id?: string }>();
+    const organizationId = requireText(
+      payload.organization_id,
+      "organization_id",
+      80,
+    );
+    const client = createUnsecureClient();
+    const { data: existing } = await client
+      .from("knowledge_bases")
+      .select()
+      .eq("organization_id", organizationId)
+      .order("updated_at", { ascending: false })
+      .limit(1)
+      .throwOnError();
+    if (existing[0]) return c.json(existing[0]);
+
+    const { data } = await client
+      .from("knowledge_bases")
+      .insert({
+        organization_id: organizationId,
+        name: "Base de conhecimento",
+        description: "Arquivos e orientações consolidadas da organização.",
+        instructions: "",
+        created_by: c.get("user")?.id ?? null,
+      })
+      .select()
+      .single()
+      .throwOnError();
+    return c.json(data, 201);
   },
 );
 
@@ -658,6 +863,7 @@ app.post(
         organization_id: organizationId,
         name,
         description,
+        instructions: "",
         created_by: c.get("user")?.id ?? null,
       })
       .select()
@@ -676,6 +882,7 @@ app.patch(
         organization_id?: string;
         name?: string;
         description?: string | null;
+        instructions?: string;
         status?: "active" | "archived";
       }
     >();
@@ -692,6 +899,18 @@ app.patch(
     if (payload.description !== undefined) {
       patch.description = payload.description?.trim() || null;
     }
+    if (payload.instructions !== undefined) {
+      if (typeof payload.instructions !== "string") {
+        throw new HTTPException(400, { message: "instructions must be text" });
+      }
+      if (payload.instructions.length > MAX_INSTRUCTIONS) {
+        throw new HTTPException(400, {
+          message:
+            `instructions must be at most ${MAX_INSTRUCTIONS} characters`,
+        });
+      }
+      patch.instructions = payload.instructions.trim();
+    }
     if (payload.status !== undefined) patch.status = payload.status;
     if (!Object.keys(patch).length) {
       throw new HTTPException(400, { message: "No changes provided" });
@@ -706,6 +925,167 @@ app.patch(
       .single()
       .throwOnError();
     return c.json(data);
+  },
+);
+
+app.post(
+  "/knowledge-management/bases/:id/synthesize",
+  requireRoles(["admin", "owner"]),
+  async (c) => {
+    const organizationId = requireText(
+      c.req.query("organization_id"),
+      "organization_id",
+      80,
+    );
+    const baseId = requireText(c.req.param("id"), "id", 80);
+    const client = createUnsecureClient();
+    const { data: base } = await client
+      .from("knowledge_bases")
+      .select()
+      .eq("id", baseId)
+      .eq("organization_id", organizationId)
+      .maybeSingle()
+      .throwOnError();
+    if (!base) {
+      throw new HTTPException(404, { message: "Knowledge base not found" });
+    }
+
+    const { data: documents } = await client
+      .from("knowledge_documents")
+      .select("file_name, extracted_text, source_type, source_url")
+      .eq("knowledge_base_id", baseId)
+      .eq("organization_id", organizationId)
+      .eq("status", "ready")
+      .eq("active", true)
+      .order("created_at", { ascending: true })
+      .throwOnError();
+    const mediaConfig = await organizationMediaConfig(organizationId);
+    const instructions = await synthesizeInstructions(
+      documents,
+      mediaConfig,
+    );
+    const { data: updated } = await client
+      .from("knowledge_bases")
+      .update({ generated_context: instructions })
+      .eq("id", baseId)
+      .eq("organization_id", organizationId)
+      .select()
+      .single()
+      .throwOnError();
+    return c.json(updated);
+  },
+);
+
+app.post(
+  "/knowledge-management/bases/:id/duplicate",
+  requireRoles(["admin", "owner"]),
+  async (c) => {
+    const payload = await c.req.json<{
+      organization_id?: string;
+      name?: string;
+      description?: string | null;
+    }>();
+    const organizationId = requireText(
+      payload.organization_id,
+      "organization_id",
+      80,
+    );
+    const sourceBaseId = requireText(c.req.param("id"), "id", 80);
+    const name = requireText(payload.name, "name", 120);
+    const description = payload.description?.trim() || null;
+    const client = createUnsecureClient();
+    const { data: sourceBase } = await client
+      .from("knowledge_bases")
+      .select()
+      .eq("id", sourceBaseId)
+      .eq("organization_id", organizationId)
+      .maybeSingle()
+      .throwOnError();
+    if (!sourceBase) {
+      throw new HTTPException(404, { message: "Knowledge base not found" });
+    }
+
+    const { data: sourceDocuments } = await client
+      .from("knowledge_documents")
+      .select()
+      .eq("organization_id", organizationId)
+      .eq("knowledge_base_id", sourceBaseId)
+      .order("created_at", { ascending: true })
+      .throwOnError();
+
+    const { data: duplicatedBase } = await client
+      .from("knowledge_bases")
+      .insert({
+        organization_id: organizationId,
+        name,
+        description: description ?? sourceBase.description,
+        instructions: sourceBase.instructions,
+        generated_context: sourceBase.generated_context,
+        status: "active",
+        created_by: c.get("user")?.id ?? null,
+      })
+      .select()
+      .single()
+      .throwOnError();
+
+    for (const sourceDocument of sourceDocuments) {
+      let storagePath: string | null = null;
+      let fileSize = sourceDocument.file_size;
+      let mimeType = sourceDocument.mime_type;
+
+      if (sourceDocument.source_type !== "url") {
+        const source = await downloadDocumentSource(sourceDocument);
+        mimeType = source.mimeType;
+        fileSize = source.bytes.length;
+        storagePath = [
+          organizationId,
+          duplicatedBase.id,
+          `${crypto.randomUUID()}-${
+            safeStorageFileName(sourceDocument.file_name)
+          }`,
+        ].join("/");
+        const { error: uploadError } = await client.storage
+          .from("knowledge")
+          .upload(
+            storagePath,
+            new Blob([source.bytes.buffer as ArrayBuffer], { type: mimeType }),
+            { upsert: false, contentType: mimeType },
+          );
+        if (uploadError) throw uploadError;
+      }
+
+      const { data: duplicatedDocument } = await client
+        .from("knowledge_documents")
+        .insert({
+          organization_id: organizationId,
+          knowledge_base_id: duplicatedBase.id,
+          file_name: sourceDocument.file_name,
+          mime_type: mimeType,
+          storage_path: storagePath,
+          source_type: sourceDocument.source_type,
+          source_url: sourceDocument.source_url,
+          file_size: fileSize,
+          status: "pending",
+          active: sourceDocument.active,
+          metadata: sourceDocument.metadata,
+          created_by: c.get("user")?.id ?? null,
+        })
+        .select()
+        .single()
+        .throwOnError();
+
+      try {
+        await processDocument(duplicatedDocument);
+      } catch (error) {
+        log.warn("Knowledge source duplication failed", {
+          source_document_id: sourceDocument.id,
+          duplicated_base_id: duplicatedBase.id,
+          error,
+        });
+      }
+    }
+
+    return c.json(duplicatedBase, 201);
   },
 );
 
@@ -771,33 +1151,61 @@ app.post(
       "knowledge_base_id",
       80,
     );
-    const storagePath = requireText(payload.storage_path, "storage_path", 500);
-    const fileName = requireText(payload.file_name, "file_name", 255);
-    const mimeType = requireText(
-      payload.mime_type || "application/octet-stream",
-      "mime_type",
-      160,
-    );
-    const fileSize = payload.file_size ?? 0;
+    const sourceType = payload.source_type ||
+      (payload.source_url ? "url" : "file");
+    if (sourceType !== "file" && sourceType !== "url") {
+      throw new HTTPException(400, {
+        message: "source_type must be file or url",
+      });
+    }
 
-    if (!storagePath.startsWith(`${organizationId}/${baseId}/`)) {
-      throw new HTTPException(400, {
-        message: "storage_path does not belong to this organization/base",
-      });
-    }
-    const pathParts = storagePath.split("/");
-    if (
-      pathParts.length !== 3 ||
-      pathParts.some((part) => !part || part === "." || part === "..")
-    ) {
-      throw new HTTPException(400, { message: "Invalid storage_path" });
-    }
-    if (
-      !Number.isInteger(fileSize) || fileSize < 1 || fileSize > MAX_FILE_SIZE
-    ) {
-      throw new HTTPException(400, {
-        message: `file_size must be between 1 and ${MAX_FILE_SIZE} bytes`,
-      });
+    let storagePath: string | null = null;
+    let sourceUrl: string | null = null;
+    let fileName: string;
+    let mimeType: string;
+    let fileSize: number;
+
+    if (sourceType === "url") {
+      sourceUrl = validateSourceUrl(payload.source_url);
+      fileName = payload.file_name?.trim() || new URL(sourceUrl).hostname;
+      if (fileName.length > 255) {
+        throw new HTTPException(400, { message: "file_name is too long" });
+      }
+      mimeType = requireText(
+        payload.mime_type || "text/html",
+        "mime_type",
+        160,
+      );
+      fileSize = 0;
+    } else {
+      storagePath = requireText(payload.storage_path, "storage_path", 500);
+      fileName = requireText(payload.file_name, "file_name", 255);
+      mimeType = requireText(
+        payload.mime_type || "application/octet-stream",
+        "mime_type",
+        160,
+      );
+      fileSize = payload.file_size ?? 0;
+
+      if (!storagePath.startsWith(`${organizationId}/${baseId}/`)) {
+        throw new HTTPException(400, {
+          message: "storage_path does not belong to this organization/base",
+        });
+      }
+      const pathParts = storagePath.split("/");
+      if (
+        pathParts.length !== 3 ||
+        pathParts.some((part) => !part || part === "." || part === "..")
+      ) {
+        throw new HTTPException(400, { message: "Invalid storage_path" });
+      }
+      if (
+        !Number.isInteger(fileSize) || fileSize < 1 || fileSize > MAX_FILE_SIZE
+      ) {
+        throw new HTTPException(400, {
+          message: `file_size must be between 1 and ${MAX_FILE_SIZE} bytes`,
+        });
+      }
     }
 
     const client = createUnsecureClient();
@@ -820,7 +1228,10 @@ app.post(
         file_name: fileName,
         mime_type: mimeType,
         storage_path: storagePath,
+        source_type: sourceType,
+        source_url: sourceUrl,
         file_size: fileSize,
+        active: true,
         status: "pending",
         created_by: c.get("user")?.id ?? null,
       })
@@ -889,6 +1300,34 @@ app.post(
   },
 );
 
+app.patch(
+  "/knowledge-management/documents/:id",
+  requireRoles(["admin", "owner"]),
+  async (c) => {
+    const organizationId = requireText(
+      c.req.query("organization_id"),
+      "organization_id",
+      80,
+    );
+    const documentId = requireText(c.req.param("id"), "id", 80);
+    const payload = await c.req.json<{ active?: boolean }>();
+    if (typeof payload.active !== "boolean") {
+      throw new HTTPException(400, { message: "active must be boolean" });
+    }
+
+    const client = createUnsecureClient();
+    const { data } = await client
+      .from("knowledge_documents")
+      .update({ active: payload.active })
+      .eq("id", documentId)
+      .eq("organization_id", organizationId)
+      .select()
+      .single()
+      .throwOnError();
+    return c.json(data);
+  },
+);
+
 app.delete(
   "/knowledge-management/documents/:id",
   requireRoles(["admin", "owner"]),
@@ -908,7 +1347,9 @@ app.delete(
       .maybeSingle()
       .throwOnError();
     if (!document) return c.body(null, 204);
-    await client.storage.from("knowledge").remove([document.storage_path]);
+    if (document.storage_path) {
+      await client.storage.from("knowledge").remove([document.storage_path]);
+    }
     await client
       .from("knowledge_documents")
       .delete()
