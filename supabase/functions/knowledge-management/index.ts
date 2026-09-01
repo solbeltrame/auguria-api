@@ -49,6 +49,7 @@ type KnowledgeDocumentInput = {
   storage_path?: string;
   source_url?: string;
   file_name?: string;
+  title?: string;
   mime_type?: string;
   file_size?: number;
 };
@@ -160,6 +161,21 @@ function validateSourceUrl(value: unknown): string {
     });
   }
   return parsed.toString();
+}
+
+function documentTitle(value: unknown, fallback: string): string {
+  if (value !== undefined && typeof value !== "string") {
+    throw new HTTPException(400, { message: "title must be a string" });
+  }
+  const title = typeof value === "string" ? value.trim() : "";
+  const normalized = title || fallback.trim();
+  if (!normalized) {
+    throw new HTTPException(400, { message: "title is required" });
+  }
+  if (normalized.length > 160) {
+    throw new HTTPException(400, { message: "title is too long" });
+  }
+  return normalized;
 }
 
 function extension(fileName: string): string {
@@ -879,6 +895,7 @@ async function processDocument(
       content,
       metadata: {
         file_name: document.file_name,
+        title: document.title,
         ...(document.source_url && { source_url: document.source_url }),
         method: extraction.method,
       } as Json,
@@ -924,7 +941,7 @@ async function processDocument(
 
 type SynthesisDocument = Pick<
   KnowledgeDocumentRow,
-  "file_name" | "extracted_text" | "source_type" | "source_url"
+  "title" | "file_name" | "extracted_text" | "source_type" | "source_url"
 >;
 
 function normalizeInstructions(value: unknown): string {
@@ -942,7 +959,7 @@ function sourceForSynthesis(
     if (!extracted) continue;
     const source = document.source_url ? `\nURL: ${document.source_url}` : "";
     sections.push(
-      `## Fonte: ${document.file_name}${source}\n${extracted.slice(0, 30_000)}`,
+      `## Fonte: ${document.title || document.file_name}${source}\n${extracted.slice(0, 30_000)}`,
     );
   }
 
@@ -1179,7 +1196,7 @@ app.post(
 
     const { data: documents } = await client
       .from("knowledge_documents")
-      .select("file_name, extracted_text, source_type, source_url")
+      .select("title, file_name, extracted_text, source_type, source_url")
       .eq("knowledge_base_id", baseId)
       .eq("organization_id", organizationId)
       .eq("status", "ready")
@@ -1287,6 +1304,7 @@ app.post(
           organization_id: organizationId,
           knowledge_base_id: duplicatedBase.id,
           file_name: sourceDocument.file_name,
+          title: sourceDocument.title,
           mime_type: mimeType,
           storage_path: storagePath,
           source_type: sourceDocument.source_type,
@@ -1389,6 +1407,7 @@ app.post(
     let storagePath: string | null = null;
     let sourceUrl: string | null = null;
     let fileName: string;
+    let title: string;
     let mimeType: string;
     let fileSize: number;
 
@@ -1398,6 +1417,7 @@ app.post(
       if (fileName.length > 255) {
         throw new HTTPException(400, { message: "file_name is too long" });
       }
+      title = documentTitle(payload.title, fileName.slice(0, 160));
       mimeType = requireText(
         payload.mime_type || "text/html",
         "mime_type",
@@ -1407,6 +1427,7 @@ app.post(
     } else {
       storagePath = requireText(payload.storage_path, "storage_path", 500);
       fileName = requireText(payload.file_name, "file_name", 255);
+      title = documentTitle(payload.title, fileName.slice(0, 160));
       mimeType = requireText(
         payload.mime_type || "application/octet-stream",
         "mime_type",
@@ -1453,6 +1474,7 @@ app.post(
         organization_id: organizationId,
         knowledge_base_id: baseId,
         file_name: fileName,
+        title,
         mime_type: mimeType,
         storage_path: storagePath,
         source_type: sourceType,
@@ -1537,15 +1559,25 @@ app.patch(
       80,
     );
     const documentId = requireText(c.req.param("id"), "id", 80);
-    const payload = await c.req.json<{ active?: boolean }>();
-    if (typeof payload.active !== "boolean") {
-      throw new HTTPException(400, { message: "active must be boolean" });
+    const payload = await c.req.json<{ active?: boolean; title?: string }>();
+    const patch: { active?: boolean; title?: string } = {};
+    if (payload.active !== undefined) {
+      if (typeof payload.active !== "boolean") {
+        throw new HTTPException(400, { message: "active must be boolean" });
+      }
+      patch.active = payload.active;
+    }
+    if (payload.title !== undefined) {
+      patch.title = documentTitle(payload.title, "");
+    }
+    if (!Object.keys(patch).length) {
+      throw new HTTPException(400, { message: "No changes provided" });
     }
 
     const client = createUnsecureClient();
     const { data } = await client
       .from("knowledge_documents")
-      .update({ active: payload.active })
+      .update(patch)
       .eq("id", documentId)
       .eq("organization_id", organizationId)
       .select()

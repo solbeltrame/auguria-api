@@ -41,6 +41,7 @@ type KnowledgeDocumentRowShape = {
   organization_id: string;
   knowledge_base_id: string;
   file_name: string;
+  title: string;
   mime_type: string;
   storage_path: string | null;
   source_type: "file" | "url";
@@ -179,6 +180,7 @@ export type Database = MergeDeep<
             organization_id: string;
             knowledge_base_id: string;
             file_name: string;
+            title?: string;
             mime_type: string;
             storage_path?: string | null;
             source_type?: KnowledgeDocumentRowShape["source_type"];
