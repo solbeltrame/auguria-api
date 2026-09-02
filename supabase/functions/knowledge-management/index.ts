@@ -14,6 +14,7 @@ import {
   groqVisionUrls,
 } from "../_shared/groq.ts";
 import { renderPdfPages } from "../_shared/pdf-renderer.ts";
+import { isReadablePdfText } from "../_shared/pdf-text-quality.ts";
 import {
   createApiClient,
   createClient,
@@ -733,7 +734,7 @@ async function extractFile(
 
   if (mimeType === "application/pdf" || fileExtension === "pdf") {
     const text = await extractPdfText(bytes);
-    if (text.length >= 20) return { text, method: "pdf-text" };
+    if (isReadablePdfText(text)) return { text, method: "pdf-text" };
     if (config.provider === "groq") {
       return await extractWithGroq(bytes, "application/pdf", fileName, config);
     }
