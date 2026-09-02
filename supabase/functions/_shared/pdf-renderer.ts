@@ -1,5 +1,3 @@
-const DEFAULT_PDFIUM_WASM_URL =
-  "https://cdn.jsdelivr.net/npm/@embedpdf/pdfium@2.15.0/dist/pdfium.wasm";
 const MAX_RENDER_DIMENSION = 1_600;
 const MAX_RENDER_PAGES = 6;
 
@@ -49,29 +47,13 @@ let pdfiumPromise: Promise<PdfiumModule> | undefined;
 
 async function loadPdfium(): Promise<PdfiumModule> {
   const { init } = await import("npm:@embedpdf/pdfium@2.15.0");
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 30_000);
-  try {
-    const wasmUrl = Deno.env.get("PDFIUM_WASM_URL") || DEFAULT_PDFIUM_WASM_URL;
-    const response = await fetch(wasmUrl, { signal: controller.signal });
-    if (!response.ok) {
-      throw new Error(
-        `Não foi possível carregar o renderizador PDF (HTTP ${response.status})`,
-      );
-    }
-    const wasmBinary = await response.arrayBuffer();
-    const module = await init({ wasmBinary });
-    const pdfium = module as unknown as PdfiumModule;
-    pdfium.PDFiumExt_Init();
-    return pdfium;
-  } catch (error) {
-    if (error instanceof Error && error.name === "AbortError") {
-      throw new Error("O renderizador PDF excedeu o tempo de inicialização");
-    }
-    throw error;
-  } finally {
-    clearTimeout(timeout);
-  }
+  const wasmBinary = await Deno.readFile(
+    new URL("./pdfium.wasm", import.meta.url),
+  );
+  const module = await init({ wasmBinary });
+  const pdfium = module as unknown as PdfiumModule;
+  pdfium.PDFiumExt_Init();
+  return pdfium;
 }
 
 async function getPdfium(): Promise<PdfiumModule> {
