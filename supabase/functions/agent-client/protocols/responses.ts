@@ -24,6 +24,10 @@ import { serializePartAsXML } from "./serializer.ts";
 import dayjs from "dayjs";
 import utc from "dayjs/plugin/utc";
 import { inspect } from "node:util";
+import {
+  AGENT_RESPONSE_POLICY,
+  cleanAgentReply,
+} from "../../_shared/humanize.ts";
 dayjs.extend(utc);
 
 // Handler for the Open Responses protocol (https://openresponses.org), the
@@ -357,6 +361,9 @@ export class ResponsesHandler
         "\nUse a ferramenta memory__remember apenas para fatos estáveis e preferências úteis. Nunca salve senhas, tokens ou segredos.";
     }
 
+    instructions += "\n\nRegras obrigatórias de identidade e resposta:\n" +
+      AGENT_RESPONSE_POLICY;
+
     const tools: ResponsesTool[] = this.tools.map((tool) => ({
       type: "function" as const,
       name: ["label" in tool && tool.label, tool.name]
@@ -573,7 +580,7 @@ export class ResponsesHandler
             version: "1",
             type: "text",
             kind: "text",
-            text: msg.text,
+            text: cleanAgentReply(msg.text ?? ""),
           },
         });
       } else if (msg.type === "file") {
@@ -601,7 +608,7 @@ export class ResponsesHandler
             type: "file",
             kind,
             file,
-            text: msg.text,
+            text: cleanAgentReply(msg.text ?? ""),
           },
         });
       }
@@ -721,7 +728,7 @@ export class ResponsesHandler
               version: "1",
               type: "text",
               kind: "text",
-              text,
+              text: cleanAgentReply(text),
             },
           },
         ],

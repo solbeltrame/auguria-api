@@ -27,8 +27,11 @@ import {
   groqVisionUrl,
 } from "../_shared/groq.ts";
 import { renderPdfPages } from "../_shared/pdf-renderer.ts";
+import { humanizeText } from "../_shared/humanize.ts";
 
 const MAX_GROQ_PDF_RENDER_DIMENSION = 1_200;
+const MAX_GROQ_IMAGE_OUTPUT_TOKENS = 2_000;
+const MAX_GROQ_PDF_OUTPUT_TOKENS = 1_200;
 
 type ModalityTokenCount = { modality: string; tokenCount: number };
 
@@ -173,6 +176,7 @@ async function preprocessWithGroq(
     const response = imageUrl
       ? await groqVisionUrl(imageUrl, imagePrompt, apiKey, model, {
         json: true,
+        maxCompletionTokens: MAX_GROQ_IMAGE_OUTPUT_TOKENS,
         reasoningEffort: "none",
       })
       : await groqVision(
@@ -181,7 +185,11 @@ async function preprocessWithGroq(
         imagePrompt,
         apiKey,
         model,
-        { json: true, reasoningEffort: "none" },
+        {
+          json: true,
+          maxCompletionTokens: MAX_GROQ_IMAGE_OUTPUT_TOKENS,
+          reasoningEffort: "none",
+        },
       );
     return {
       result: parseModelJson(response.text) || { transcription: response.text },
@@ -203,10 +211,13 @@ async function preprocessWithGroq(
           bytes: image,
           mimeType: "image/png",
         })),
-        `${prompt}\nLeia as páginas na ordem apresentada e preserve a separação por página. Responda em Markdown, sem inventar conteúdo.`,
+        `${prompt}\nLeia as páginas na ordem apresentada e preserve a separação por página. Responda em texto simples, sem Markdown, sem inventar conteúdo e sem mencionar páginas que não foram enviadas.`,
         apiKey,
         model,
-        { maxCompletionTokens: 6_000, reasoningEffort: "none" },
+        {
+          maxCompletionTokens: MAX_GROQ_PDF_OUTPUT_TOKENS,
+          reasoningEffort: "none",
+        },
       );
       sections.push(response.text);
       if (response.usage) usages.push(response.usage);
@@ -546,7 +557,7 @@ Deno.serve(async (req) => {
       break;
     case "image":
       prompt =
-        `Analyze this image. If it contains text, extract it as transcription in its original language using markdown format if possible. Provide a brief description in ${language} of the image content, or if it's a document, specify the document type (invoice, receipt, etc.) and include relevant information (dates, amounts, etc.).`;
+        `Analyze this image. If it contains text, extract it as a clear plain-text transcription in its original language. Do not use Markdown, asterisks, tables or separator lines. Provide a brief description in ${language} of the image content, or if it's a document, specify the document type (invoice, receipt, etc.) and include relevant information (dates, amounts, etc.).`;
       break;
     case "document":
       if (mimeType === "text/csv") {
@@ -554,7 +565,7 @@ Deno.serve(async (req) => {
           `Analyze this CSV document. Do not transcribe! Do not extract the data as a table either! Provide a brief description in ${language} of the data (column names, row samples, etc.).`;
       } else if (mimeType === "application/pdf") {
         prompt =
-          `Analyze this PDF document. Extract the text content as transcription in its original language using markdown format if possible. If the content includes a table, do not transcribe the table. Instead, provide the table as an array of arrays; the first row should contain the column names (if the header is multi-row, flatten it and pick sensible column names). Do not treat key-value data as a table (avoid single-row tables). Provide a brief description in ${language} of the document, specify the document type (invoice, receipt, etc.) and include relevant information (dates, amounts, etc.).`;
+          `Analyze this PDF document. Extract the text content as a clear plain-text transcription in its original language. Do not use Markdown, asterisks or separator lines. If the content includes a table, provide its information in readable sentences. Provide a brief description in ${language} of the document, specify the document type (invoice, receipt, etc.) and include relevant information (dates, amounts, etc.).`;
       } else {
         prompt =
           `Analyze this text document. Do not transcribe! If the content includes a table, provide the table as an array of arrays; the first row should contain the column names (if the header is multi-row, flatten it and pick sensible column names). Do not treat key-value data as a table (avoid single-row tables). Provide a brief description in ${language} of the document, specify the document type (invoice, receipt, etc.) and include relevant information (dates, amounts, etc.).`;
@@ -670,6 +681,11 @@ Deno.serve(async (req) => {
         "Failed to parse the response text from the preprocessing model into a JSON object. Skipping preprocessing.",
       );
     }
+  }
+
+  if (result.description) result.description = humanizeText(result.description);
+  if (result.transcription) {
+    result.transcription = humanizeText(result.transcription);
   }
 
   if (googleUsage) {

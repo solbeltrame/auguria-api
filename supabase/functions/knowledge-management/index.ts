@@ -14,6 +14,7 @@ import {
   groqVisionUrls,
 } from "../_shared/groq.ts";
 import { renderPdfPages } from "../_shared/pdf-renderer.ts";
+import { humanizeText } from "../_shared/humanize.ts";
 import {
   isReadablePdfText,
   keepExpectedPdfPages,
@@ -569,8 +570,8 @@ async function extractWithGemini(
   const prompt = mimeType.startsWith("audio/")
     ? `Transcreva este áudio em seu idioma original. Identifique falas, nomes, números e informações úteis. Arquivo: ${fileName}.`
     : mimeType.startsWith("image/")
-    ? `Leia e descreva esta imagem. Extraia todo texto visível, valores, datas e tabelas de forma organizada. Arquivo: ${fileName}.`
-    : `Extraia e organize todo o conteúdo textual deste arquivo. Preserve títulos, listas, tabelas, valores e datas. Arquivo: ${fileName}.`;
+    ? `Leia e descreva esta imagem em texto simples. Extraia todo texto visível, valores, datas e tabelas de forma clara. Não use Markdown, asteriscos, barras verticais ou separadores. Arquivo: ${fileName}.`
+    : `Extraia e organize todo o conteúdo textual deste arquivo em texto simples. Preserve títulos, listas, tabelas, valores e datas sem usar Markdown, asteriscos, barras verticais ou separadores. Arquivo: ${fileName}.`;
 
   const response = await genai.models.generateContent({
     model,
@@ -679,7 +680,7 @@ async function extractWithGroq(
         const lastPage = index + batchUrls.length;
         const response = await groqVisionUrls(
           batchUrls,
-          `Você recebeu exatamente ${batchUrls.length} imagem(ns), correspondente(s) às páginas ${firstPage} a ${lastPage} deste PDF. Extraia todo o texto visível, valores, datas e tabelas em Markdown, preservando a separação por página. Não crie, descreva ou mencione páginas além desse intervalo. Não invente conteúdo. Arquivo: ${fileName}.`,
+          `Você recebeu exatamente ${batchUrls.length} imagem(ns), correspondente(s) às páginas ${firstPage} a ${lastPage} deste PDF. Extraia todo o texto visível, valores, datas e tabelas em texto simples, preservando a separação por página. Não use Markdown, asteriscos, barras verticais ou separadores. Não crie, descreva ou mencione páginas além desse intervalo. Não invente conteúdo. Arquivo: ${fileName}.`,
           config.apiKey,
           config.model,
           {
@@ -1001,7 +1002,11 @@ async function processDocument(
       MAX_DOCUMENT_EXTRACTION_MS,
       "A interpretação excedeu o limite de tempo. Tente processar novamente ou reduza o arquivo.",
     );
-    const chunks = splitIntoChunks(extraction.text);
+    const extractedText = humanizeText(extraction.text).slice(
+      0,
+      MAX_EXTRACTED_TEXT,
+    );
+    const chunks = splitIntoChunks(extractedText);
     if (!chunks.length) {
       throw new Error("Não foi possível gerar trechos para indexação");
     }
@@ -1044,7 +1049,7 @@ async function processDocument(
       .update({
         status: "ready",
         mime_type: source.mimeType,
-        extracted_text: extraction.text,
+        extracted_text: extractedText,
         metadata,
         error_message: null,
       })
@@ -1089,11 +1094,13 @@ function sourceForSynthesis(
   const sections: string[] = [];
 
   for (const document of documents) {
-    const extracted = normalizeText(document.extracted_text ?? "");
+    const extracted = humanizeText(
+      normalizeText(document.extracted_text ?? ""),
+    );
     if (!extracted) continue;
     const source = document.source_url ? `\nURL: ${document.source_url}` : "";
     sections.push(
-      `## Fonte: ${document.title || document.file_name}${source}\n${
+      `Fonte: ${document.title || document.file_name}${source}\n${
         extracted.slice(0, 30_000)
       }`,
     );
@@ -1109,7 +1116,7 @@ function compiledInstructions(
   if (!source) return "";
 
   return [
-    "# Contexto consolidado do negócio",
+    "Contexto consolidado do negócio",
     "",
     "Use este documento como referência operacional. Preserve fatos, preços, horários, políticas e exceções. Quando algo não estiver aqui, peça confirmação em vez de inventar.",
     "",
@@ -1130,10 +1137,11 @@ async function synthesizeInstructions(
   try {
     const prompt = [
       "Você é o editor da base de conhecimento de uma empresa.",
-      "Consolide as fontes abaixo em um único documento Markdown em português do Brasil para orientar um agente de atendimento.",
+      "Consolide as fontes abaixo em um único texto em português do Brasil para orientar um agente de atendimento.",
       "Remova duplicações, preserve números, preços, nomes, horários, regras e exceções, e sinalize conflitos sem escolher um lado.",
       "Não invente informações, não escreva prefácio nem explique o processo.",
-      "Organize o resultado em: identidade e escopo, produtos/serviços, políticas e regras, operação e atendimento, perguntas frequentes e casos de exceção.",
+      "Organize o resultado em parágrafos curtos, com títulos simples e marcadores • quando necessário. Não use Markdown, asteriscos, hashtags, barras verticais, tabelas ou separadores.",
+      "Inclua logo no início o nome da empresa e um resumo claro do que ela faz, se isso aparecer nas fontes.",
       "\nFONTES:\n",
       source,
     ].join("\n");
@@ -1153,7 +1161,7 @@ async function synthesizeInstructions(
           reasoningEffort: "none",
         },
       );
-      return normalizeInstructions(response.text) || fallback;
+      return normalizeInstructions(humanizeText(response.text)) || fallback;
     }
 
     const genai = new GoogleGenAI({ apiKey: config.apiKey });
@@ -1167,7 +1175,9 @@ async function synthesizeInstructions(
         maxOutputTokens: 12_000,
       },
     });
-    const generated = normalizeInstructions(response.text);
+    const generated = normalizeInstructions(
+      humanizeText(response.text ?? ""),
+    );
     return generated || fallback;
   } catch (error) {
     log.warn("Knowledge synthesis failed; keeping compiled context", error);

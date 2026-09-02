@@ -33,6 +33,10 @@ import { serializePartAsXML } from "./serializer.ts";
 import dayjs from "dayjs";
 import utc from "dayjs/plugin/utc";
 import { inspect } from "node:util";
+import {
+  AGENT_RESPONSE_POLICY,
+  cleanAgentReply,
+} from "../../_shared/humanize.ts";
 dayjs.extend(utc);
 
 // Whether this agent answers by calling `respond` (several messages per
@@ -416,6 +420,9 @@ export class ChatCompletionsHandler
         "\nUse a ferramenta memory__remember apenas para fatos estáveis e preferências úteis. Nunca salve senhas, tokens ou segredos.";
     }
 
+    content += "\n\nRegras obrigatórias de identidade e resposta:\n" +
+      AGENT_RESPONSE_POLICY;
+
     chatCompletionMessages.unshift({
       role: "system",
       content,
@@ -679,7 +686,7 @@ export class ChatCompletionsHandler
             version: "1",
             type: "text",
             kind: "text",
-            text: msg.text,
+            text: cleanAgentReply(msg.text ?? ""),
           },
         });
       } else if (msg.type === "file") {
@@ -707,7 +714,7 @@ export class ChatCompletionsHandler
             type: "file",
             kind,
             file,
-            text: msg.text,
+            text: cleanAgentReply(msg.text ?? ""),
           },
         });
       }
@@ -829,7 +836,7 @@ export class ChatCompletionsHandler
               version: "1",
               type: "text",
               kind: "text",
-              text: message.content,
+              text: cleanAgentReply(message.content),
             },
           },
         ],
