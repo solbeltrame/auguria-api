@@ -180,6 +180,14 @@ function validateSourceUrl(value: unknown): string {
   return parsed.toString();
 }
 
+function instagramLocalizedUrl(sourceUrl: string): string | undefined {
+  const parsed = new URL(sourceUrl);
+  if (!/^(.+\.)?instagram\.com$/i.test(parsed.hostname)) return undefined;
+  if (parsed.searchParams.has("hl")) return undefined;
+  parsed.searchParams.set("hl", "pt-br");
+  return parsed.toString();
+}
+
 function documentTitle(value: unknown, fallback: string): string {
   if (value !== undefined && typeof value !== "string") {
     throw new HTTPException(400, { message: "title must be a string" });
@@ -883,6 +891,16 @@ async function downloadDocumentSource(document: KnowledgeDocumentRow): Promise<{
         },
         redirect: "manual",
       });
+      if (response.status === 429) {
+        const localizedUrl = instagramLocalizedUrl(sourceUrl);
+        if (localizedUrl) {
+          sourceUrl = localizedUrl;
+          continue;
+        }
+        throw new Error(
+          "O site limitou os acessos temporariamente (HTTP 429). Tente novamente mais tarde ou use outra fonte pública.",
+        );
+      }
       if (![301, 302, 303, 307, 308].includes(response.status)) break;
       const location = response.headers.get("location");
       if (!location) {
