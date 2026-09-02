@@ -30,15 +30,17 @@ const MAX_FILE_SIZE = 20 * 1000 * 1000;
 const MAX_EXTRACTED_TEXT = 2_000_000;
 const MAX_INSTRUCTIONS = 60_000;
 const MAX_SYNTHESIS_SOURCE = 140_000;
+const MAX_GROQ_SYNTHESIS_SOURCE = 14_000;
 const CHUNK_SIZE = 1_200;
 const CHUNK_OVERLAP = 160;
 const KNOWLEDGE_GEMINI_MODEL = "gemini-2.5-flash";
 const KNOWLEDGE_GROQ_MODEL = "qwen/qwen3.6-27b";
 const KNOWLEDGE_GROQ_TRANSCRIPTION_MODEL = "whisper-large-v3-turbo";
-const MAX_GROQ_PDF_PAGES = 6;
+const MAX_GROQ_PDF_PAGES = 3;
 const MAX_GROQ_PDF_RENDER_DIMENSION = 1_200;
 const MAX_GROQ_IMAGE_DIMENSION = 1_200;
-const MAX_GROQ_IMAGE_OUTPUT_TOKENS = 6_000;
+const MAX_GROQ_IMAGE_OUTPUT_TOKENS = 3_500;
+const MAX_GROQ_PDF_OUTPUT_TOKENS = 1_200;
 const MAX_DOCUMENT_EXTRACTION_MS = 100_000;
 const STALE_PROCESSING_MS = 5 * 60 * 1_000;
 const MAX_PDF_TEXT_STREAM_BYTES = 512_000;
@@ -451,11 +453,10 @@ function extractPdfOperators(source: string): string {
 }
 
 async function inflatePdfStream(bytes: Uint8Array): Promise<Uint8Array> {
-  const decompressor = new DecompressionStream("deflate");
-  const writer = decompressor.writable.getWriter();
-  await writer.write(bytes as unknown as Uint8Array<ArrayBuffer>);
-  await writer.close();
-  const reader = decompressor.readable.getReader();
+  const reader = new Blob([bytes as unknown as BlobPart])
+    .stream()
+    .pipeThrough(new DecompressionStream("deflate"))
+    .getReader();
   const parts: Uint8Array[] = [];
   let total = 0;
 
@@ -675,7 +676,7 @@ async function extractWithGroq(
           config.apiKey,
           config.model,
           {
-            maxCompletionTokens: MAX_GROQ_IMAGE_OUTPUT_TOKENS,
+            maxCompletionTokens: MAX_GROQ_PDF_OUTPUT_TOKENS,
             reasoningEffort: "none",
           },
         );
@@ -1129,13 +1130,17 @@ async function synthesizeInstructions(
     ].join("\n");
 
     if (config.provider === "groq") {
+      const groqSource = source.slice(0, MAX_GROQ_SYNTHESIS_SOURCE);
       const response = await groqChat(
-        [{ role: "user", content: prompt }],
+        [{
+          role: "user",
+          content: prompt.replace(source, groqSource),
+        }],
         config.apiKey,
         {
           model: config.model,
           temperature: 0.15,
-          maxCompletionTokens: 12_000,
+          maxCompletionTokens: 2_500,
           reasoningEffort: "none",
         },
       );
