@@ -14,7 +14,10 @@ import {
   groqVisionUrls,
 } from "../_shared/groq.ts";
 import { renderPdfPages } from "../_shared/pdf-renderer.ts";
-import { isReadablePdfText } from "../_shared/pdf-text-quality.ts";
+import {
+  isReadablePdfText,
+  keepExpectedPdfPages,
+} from "../_shared/pdf-text-quality.ts";
 import {
   createApiClient,
   createClient,
@@ -671,9 +674,12 @@ async function extractWithGroq(
     const sections: string[] = [];
     try {
       for (let index = 0; index < published.urls.length; index += 3) {
+        const batchUrls = published.urls.slice(index, index + 3);
+        const firstPage = index + 1;
+        const lastPage = index + batchUrls.length;
         const response = await groqVisionUrls(
-          published.urls.slice(index, index + 3),
-          `Leia as páginas deste PDF na ordem apresentada. Extraia todo o texto visível, valores, datas e tabelas em Markdown, preservando a separação por página. Não invente conteúdo. Arquivo: ${fileName}.`,
+          batchUrls,
+          `Você recebeu exatamente ${batchUrls.length} imagem(ns), correspondente(s) às páginas ${firstPage} a ${lastPage} deste PDF. Extraia todo o texto visível, valores, datas e tabelas em Markdown, preservando a separação por página. Não crie, descreva ou mencione páginas além desse intervalo. Não invente conteúdo. Arquivo: ${fileName}.`,
           config.apiKey,
           config.model,
           {
@@ -681,7 +687,9 @@ async function extractWithGroq(
             reasoningEffort: "none",
           },
         );
-        sections.push(normalizeText(response.text));
+        sections.push(
+          normalizeText(keepExpectedPdfPages(response.text, lastPage)),
+        );
       }
     } finally {
       await published.cleanup();
