@@ -50,6 +50,7 @@ const MAX_GROQ_PDF_OUTPUT_TOKENS = 1_200;
 const MAX_DOCUMENT_EXTRACTION_MS = 100_000;
 const STALE_PROCESSING_MS = 5 * 60 * 1_000;
 const MAX_SOURCE_REDIRECTS = 5;
+const MIN_WEB_SOURCE_TEXT = 80;
 const MAX_PDF_TEXT_STREAM_BYTES = 512_000;
 const MAX_PDF_DECOMPRESSED_STREAM_BYTES = 4_000_000;
 const MAX_PDF_OPERATOR_SOURCE_BYTES = 1_000_000;
@@ -1054,6 +1055,15 @@ async function processDocument(
       0,
       MAX_EXTRACTED_TEXT,
     );
+    if (
+      document.source_type === "url" &&
+      source.mimeType === "text/html" &&
+      extractedText.length < MIN_WEB_SOURCE_TEXT
+    ) {
+      throw new Error(
+        "A página não entregou conteúdo público suficiente. Ela pode exigir login ou ter limitado os acessos; tente novamente mais tarde ou use outra fonte pública.",
+      );
+    }
     const chunks = splitIntoChunks(extractedText);
     if (!chunks.length) {
       throw new Error("Não foi possível gerar trechos para indexação");
