@@ -195,6 +195,40 @@ export async function groqVisionUrl(
   );
 }
 
+export async function groqVisionUrls(
+  imageUrls: string[],
+  prompt: string,
+  apiKey: string,
+  model: string,
+  options: {
+    maxCompletionTokens?: number;
+    reasoningEffort?: GroqReasoningEffort;
+  } = {},
+): Promise<{ text: string; usage?: GroqUsage }> {
+  if (!imageUrls.length) {
+    throw new Error("Nenhuma imagem foi fornecida ao Groq");
+  }
+  if (imageUrls.length > 3) {
+    throw new Error("O Groq aceita no máximo 3 imagens por requisição");
+  }
+
+  const content: GroqMessage["content"] = [{ type: "text", text: prompt }];
+  for (const imageUrl of imageUrls) {
+    content.push({ type: "image_url", image_url: { url: imageUrl } });
+  }
+
+  return await groqChat(
+    [{ role: "user", content }],
+    apiKey,
+    {
+      model,
+      temperature: 0.1,
+      maxCompletionTokens: options.maxCompletionTokens ?? 8_000,
+      reasoningEffort: options.reasoningEffort,
+    },
+  );
+}
+
 export async function groqVisionBatch(
   images: Array<{ bytes: Uint8Array; mimeType: string }>,
   prompt: string,

@@ -10,7 +10,8 @@ import {
   groqChat,
   groqTranscribe,
   groqVision,
-  groqVisionBatch,
+  groqVisionUrl,
+  groqVisionUrls,
 } from "../_shared/groq.ts";
 import { renderPdfPages } from "../_shared/pdf-renderer.ts";
 import {
@@ -71,6 +72,9 @@ type MediaConfig = {
   transcriptionModel: string;
   language?: string;
   imageUrl?: string;
+  publishImages?: (
+    images: Uint8Array[],
+  ) => Promise<{ urls: string[]; cleanup: () => Promise<void> }>;
 };
 
 const app = new Hono<AppEnv>();
@@ -549,34 +553,6 @@ function isAiMedia(mimeType: string): boolean {
     mimeType.startsWith("video/");
 }
 
-async function fetchPreparedImage(
-  imageUrl: string | undefined,
-): Promise<{ bytes: Uint8Array; mimeType: string } | undefined> {
-  if (!imageUrl) return undefined;
-
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 15_000);
-  try {
-    const response = await fetch(imageUrl, { signal: controller.signal });
-    if (!response.ok) {
-      log.warn("Could not download transformed knowledge image", {
-        status: response.status,
-      });
-      return undefined;
-    }
-    const bytes = new Uint8Array(await response.arrayBuffer());
-    if (!bytes.length) return undefined;
-    const mimeType = response.headers.get("content-type")?.split(";", 1)[0]
-      ?.toLowerCase() || "";
-    return { bytes, mimeType };
-  } catch (error) {
-    log.warn("Could not download transformed knowledge image", { error });
-    return undefined;
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
 async function extractWithGemini(
   bytes: Uint8Array,
   mimeType: string,
@@ -635,29 +611,35 @@ async function extractWithGroq(
   }
 
   if (mimeType.startsWith("image/")) {
-    const prepared = await fetchPreparedImage(config.imageUrl);
-    const imageBytes = prepared?.bytes || bytes;
-    const imageMimeType = prepared?.mimeType || mimeType;
     if (
-      !["image/png", "image/jpeg", "image/webp"].includes(imageMimeType)
+      !["image/png", "image/jpeg", "image/webp"].includes(mimeType)
     ) {
       throw new Error(
-        `O Groq aceita imagens PNG, JPEG ou WebP; ${imageMimeType} precisa ser convertido antes do envio`,
+        `O Groq aceita imagens PNG, JPEG ou WebP; ${mimeType} precisa ser convertido antes do envio`,
       );
     }
     const prompt =
       `Leia e descreva esta imagem em português do Brasil. Extraia todo texto visível, valores, datas e tabelas de forma organizada. Arquivo: ${fileName}.`;
-    const response = await groqVision(
-      imageBytes,
-      imageMimeType,
-      prompt,
-      config.apiKey,
-      config.model,
-      {
-        maxCompletionTokens: MAX_GROQ_IMAGE_OUTPUT_TOKENS,
-        reasoningEffort: "none",
-      },
-    );
+    const options = {
+      maxCompletionTokens: MAX_GROQ_IMAGE_OUTPUT_TOKENS,
+      reasoningEffort: "none" as const,
+    };
+    const response = config.imageUrl
+      ? await groqVisionUrl(
+        config.imageUrl,
+        prompt,
+        config.apiKey,
+        config.model,
+        options,
+      )
+      : await groqVision(
+        bytes,
+        mimeType,
+        prompt,
+        config.apiKey,
+        config.model,
+        options,
+      );
     return { text: normalizeText(response.text), method: "groq" };
   }
 
@@ -679,23 +661,28 @@ async function extractWithGroq(
       MAX_GROQ_PDF_PAGES,
       MAX_GROQ_PDF_RENDER_DIMENSION,
     );
+    if (!config.publishImages) {
+      throw new Error("Não foi possível preparar as páginas do PDF");
+    }
+
+    const published = await config.publishImages(rendered.images);
     const sections: string[] = [];
-    for (let index = 0; index < rendered.images.length; index += 3) {
-      const batch = rendered.images.slice(index, index + 3).map((image) => ({
-        bytes: image,
-        mimeType: "image/png",
-      }));
-      const response = await groqVisionBatch(
-        batch,
-        `Leia as páginas deste PDF na ordem apresentada. Extraia todo o texto visível, valores, datas e tabelas em Markdown, preservando a separação por página. Não invente conteúdo. Arquivo: ${fileName}.`,
-        config.apiKey,
-        config.model,
-        {
-          maxCompletionTokens: MAX_GROQ_IMAGE_OUTPUT_TOKENS,
-          reasoningEffort: "none",
-        },
-      );
-      sections.push(normalizeText(response.text));
+    try {
+      for (let index = 0; index < published.urls.length; index += 3) {
+        const response = await groqVisionUrls(
+          published.urls.slice(index, index + 3),
+          `Leia as páginas deste PDF na ordem apresentada. Extraia todo o texto visível, valores, datas e tabelas em Markdown, preservando a separação por página. Não invente conteúdo. Arquivo: ${fileName}.`,
+          config.apiKey,
+          config.model,
+          {
+            maxCompletionTokens: MAX_GROQ_IMAGE_OUTPUT_TOKENS,
+            reasoningEffort: "none",
+          },
+        );
+        sections.push(normalizeText(response.text));
+      }
+    } finally {
+      await published.cleanup();
     }
     if (rendered.pageCount > rendered.renderedPages) {
       sections.push(
@@ -927,6 +914,50 @@ async function downloadDocumentSource(document: KnowledgeDocumentRow): Promise<{
   return { bytes, mimeType: document.mime_type, sourceUrl: signed?.signedUrl };
 }
 
+async function publishTemporaryPdfPages(
+  client: ReturnType<typeof createUnsecureClient>,
+  document: KnowledgeDocumentRow,
+  images: Uint8Array[],
+): Promise<{ urls: string[]; cleanup: () => Promise<void> }> {
+  const paths = images.map((_, index) =>
+    `${document.organization_id}/${document.knowledge_base_id}/.processing-${document.id}-${
+      index + 1
+    }.png`
+  );
+  const bucket = client.storage.from("knowledge");
+
+  const cleanup = async () => {
+    const { error } = await bucket.remove(paths);
+    if (error) {
+      log.warn("Could not remove temporary PDF pages", {
+        document_id: document.id,
+        error,
+      });
+    }
+  };
+
+  try {
+    await Promise.all(images.map(async (image, index) => {
+      const { error } = await bucket.upload(paths[index], image, {
+        contentType: "image/png",
+        cacheControl: "60",
+        upsert: true,
+      });
+      if (error) throw error;
+    }));
+
+    const urls = await Promise.all(paths.map(async (path) => {
+      const { data, error } = await bucket.createSignedUrl(path, 600);
+      if (error) throw error;
+      return data.signedUrl;
+    }));
+    return { urls, cleanup };
+  } catch (error) {
+    await cleanup();
+    throw error;
+  }
+}
+
 async function processDocument(
   document: KnowledgeDocumentRow,
 ): Promise<KnowledgeDocumentRow> {
@@ -950,7 +981,12 @@ async function processDocument(
         bytes,
         document.file_name,
         source.mimeType,
-        { ...config, imageUrl: source.sourceUrl },
+        {
+          ...config,
+          imageUrl: source.sourceUrl,
+          publishImages: (images) =>
+            publishTemporaryPdfPages(client, document, images),
+        },
       ),
       MAX_DOCUMENT_EXTRACTION_MS,
       "A interpretação excedeu o limite de tempo. Tente processar novamente ou reduza o arquivo.",
