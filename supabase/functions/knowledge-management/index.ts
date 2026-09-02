@@ -14,6 +14,7 @@ import {
   groqVisionUrls,
 } from "../_shared/groq.ts";
 import { renderPdfPages } from "../_shared/pdf-renderer.ts";
+import { extractHtmlText } from "../_shared/html.ts";
 import { humanizeText } from "../_shared/humanize.ts";
 import {
   isReadablePdfText,
@@ -48,6 +49,7 @@ const MAX_GROQ_IMAGE_OUTPUT_TOKENS = 3_500;
 const MAX_GROQ_PDF_OUTPUT_TOKENS = 1_200;
 const MAX_DOCUMENT_EXTRACTION_MS = 100_000;
 const STALE_PROCESSING_MS = 5 * 60 * 1_000;
+const MAX_SOURCE_REDIRECTS = 5;
 const MAX_PDF_TEXT_STREAM_BYTES = 512_000;
 const MAX_PDF_DECOMPRESSED_STREAM_BYTES = 4_000_000;
 const MAX_PDF_OPERATOR_SOURCE_BYTES = 1_000_000;
@@ -784,7 +786,7 @@ async function extractFile(
   ) {
     const decoded = new TextDecoder().decode(bytes);
     const text = normalizeText(
-      mimeType === "text/html" ? decodeXml(decoded) : decoded,
+      mimeType === "text/html" ? extractHtmlText(decoded) : decoded,
     );
     if (!text) throw new Error("O arquivo de texto está vazio");
     return { text, method: "text" };
@@ -866,12 +868,40 @@ async function downloadDocumentSource(document: KnowledgeDocumentRow): Promise<{
 }> {
   if (document.source_type === "url") {
     if (!document.source_url) throw new Error("A fonte não possui uma URL");
-    const response = await fetch(document.source_url, {
-      headers: { accept: "text/html,text/plain,application/json,*/*" },
-      redirect: "manual",
-    });
+    let sourceUrl = document.source_url;
+    let response: Response | undefined;
+    for (
+      let redirectCount = 0;
+      redirectCount <= MAX_SOURCE_REDIRECTS;
+      redirectCount++
+    ) {
+      response = await fetch(sourceUrl, {
+        headers: {
+          accept: "text/html,text/plain,application/json,*/*",
+          "accept-language": "pt-BR,pt;q=0.9,en;q=0.8",
+          "user-agent": "AuguriaKnowledge/1.0 (+https://auguria.pages.dev)",
+        },
+        redirect: "manual",
+      });
+      if (![301, 302, 303, 307, 308].includes(response.status)) break;
+      const location = response.headers.get("location");
+      if (!location) {
+        throw new Error("A URL redirecionou sem informar o destino");
+      }
+      if (redirectCount === MAX_SOURCE_REDIRECTS) {
+        throw new Error("A URL excedeu o limite de redirecionamentos");
+      }
+      let redirectedUrl: URL;
+      try {
+        redirectedUrl = new URL(location, sourceUrl);
+      } catch {
+        throw new Error("A URL redirecionou para um endereço inválido");
+      }
+      sourceUrl = validateSourceUrl(redirectedUrl.toString());
+    }
+    if (!response) throw new Error("Não foi possível acessar a URL");
     if (response.status >= 300 && response.status < 400) {
-      throw new Error("A URL redirecionou; cadastre o endereço final da fonte");
+      throw new Error("A URL redirecionou sem informar um destino válido");
     }
     if (!response.ok) {
       throw new Error(`A URL respondeu com HTTP ${response.status}`);
@@ -888,7 +918,7 @@ async function downloadDocumentSource(document: KnowledgeDocumentRow): Promise<{
       bytes,
       mimeType: response.headers.get("content-type")?.split(";", 1)[0] ||
         document.mime_type,
-      sourceUrl: document.source_url,
+      sourceUrl,
     };
   }
 
