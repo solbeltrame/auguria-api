@@ -1795,9 +1795,9 @@ app.post(
     if (!document) {
       throw new HTTPException(404, { message: "Knowledge document not found" });
     }
-    if (document.status !== "error") {
+    if (document.status === "pending" || document.status === "processing") {
       throw new HTTPException(409, {
-        message: "Only documents with an error can be reprocessed",
+        message: "A fonte já está aguardando ou em processamento",
       });
     }
 
